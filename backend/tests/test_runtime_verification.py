@@ -23,11 +23,17 @@ def verifier(tmp_path, monkeypatch):
                     "image_id": IMAGE,
                     "replicas": 1,
                     "memory_bytes": 1024,
+                    "ports": [{"target": 8080, "published": 8080}],
                     "networks": [],
                 }
             },
             "networks": {},
-            "probe_url": "http://127.0.0.1:8080",
+            "probes": {
+                "entry_service": "backend",
+                "health": {"path": "/health", "expect": {"database": "UP"}},
+                "routing": {"path": "/api/instance", "field": "instance", "service": "backend"},
+                "records": {"path": "/api/records", "id_field": "id", "value_field": "value"},
+            },
         }
     )
     snapshot = {
@@ -40,7 +46,7 @@ def verifier(tmp_path, monkeypatch):
                 "image": IMAGE,
                 "memory": 1024,
                 "restart": "no",
-                "ports": {},
+                "ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]},
                 "networks": [],
                 "mounts": [],
             }

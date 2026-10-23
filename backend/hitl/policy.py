@@ -153,8 +153,8 @@ def validate_model(model, project_dir):
                 raise ValueError("Demo chỉ dùng bridge network/local volume.")
 
 
-def source_fingerprints(compose_path, model):
-    paths = {str(compose_path.resolve())}
+def source_fingerprints(compose_path, model, extra=()):
+    paths = {str(compose_path.resolve()), *(str(Path(p).resolve()) for p in extra)}
     for service in model["services"].values():
         for volume in service.get("volumes", []):
             if volume["type"] == "bind":

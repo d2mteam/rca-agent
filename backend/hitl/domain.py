@@ -68,14 +68,55 @@ class VolumeSpec(DomainModel):
     name: str
 
 
+JsonScalar = str | int | float | bool
+HttpPath = Annotated[str, StringConstraints(pattern=r"^/\S*$", max_length=200)]
+
+
+class HealthProbe(DomainModel):
+    path: HttpPath
+    expect: dict[str, JsonScalar] = Field(default_factory=dict)
+
+
+class RoutingProbe(DomainModel):
+    path: HttpPath
+    field: str = Field(default="instance", min_length=1)
+    service: Name
+
+
+class RecordsProbe(DomainModel):
+    path: HttpPath
+    id_field: str = Field(default="id", min_length=1)
+    value_field: str = Field(default="value", min_length=1)
+
+
+class ProbeSpec(DomainModel):
+    """Application-level acceptance checks declared per project in probes.yaml.
+
+    The verifier knows nothing about any particular application: entry point, URLs and
+    JSON fields all come from here, never from service names.
+    """
+
+    entry_service: Name
+    health: HealthProbe
+    routing: RoutingProbe | None = None
+    records: RecordsProbe | None = None
+
+
 class InfrastructureSpec(DomainModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     policy_snapshot: GatewayPolicy = Field(default_factory=GatewayPolicy)
     project: str = Field(pattern=r"^hitl-[a-z0-9][a-z0-9-]{0,39}$")
     services: dict[Name, ServiceSpec]
     networks: dict[Name, NetworkSpec]
     volumes: dict[Name, VolumeSpec] = Field(default_factory=dict)
-    probe_url: str | None = None
+    probes: ProbeSpec | None = None
+
+    @property
+    def probe_url(self):
+        if not self.probes:
+            return None
+        port = self.services[self.probes.entry_service].ports[0]
+        return f"http://{port.host_ip}:{port.published}"
 
     @model_validator(mode="after")
     def semantics(self):
@@ -152,10 +193,18 @@ class InfrastructureSpec(DomainModel):
         for name, volume in self.volumes.items():
             if volume.name != f"{self.project}_{name}":
                 raise ValueError("Volume phải thuộc project.")
+        if self.probes:
+            entry = self.services.get(self.probes.entry_service)
+            if entry is None or not entry.ports:
+                raise ValueError(
+                    "probes: entry_service phải là service trong Compose và publish ít nhất một port."
+                )
+            if self.probes.routing and self.probes.routing.service not in self.services:
+                raise ValueError("probes: routing.service không tồn tại trong Compose.")
         return self
 
     @classmethod
-    def from_compose(cls, model, image_ids, policy=None):
+    def from_compose(cls, model, image_ids, policy=None, probes=None):
         services = {}
         for name, service in model["services"].items():
             services[name] = ServiceSpec(
@@ -197,7 +246,6 @@ class InfrastructureSpec(DomainModel):
                 init=service.get("init"),
                 labels=service.get("labels", {}),
             )
-        ports = services.get("nginx").ports if "nginx" in services else []
         return cls(
             project=model["name"],
             policy_snapshot=policy or GatewayPolicy(),
@@ -207,9 +255,7 @@ class InfrastructureSpec(DomainModel):
                 for n, v in model.get("networks", {}).items()
             },
             volumes={n: VolumeSpec(name=v["name"]) for n, v in model.get("volumes", {}).items()},
-            probe_url=f"http://127.0.0.1:{ports[0].published}"
-            if ports and {"backend", "db"} <= services.keys()
-            else None,
+            probes=probes,
         )
 
     def to_compose(self):

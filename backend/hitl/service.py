@@ -4,8 +4,11 @@ import shutil
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
-from .domain import InfrastructureSpec, plan_hash
+from .domain import InfrastructureSpec, ProbeSpec, plan_hash
 from .gateway import enforce_request
 from .governance import GatewayPolicy, PolicyStore
 from .mcp_client import DockerTools
@@ -35,6 +38,17 @@ class InfraService:
             raise ValueError("Project chưa được đăng ký.")
         return path
 
+    def project_probes(self, compose_path):
+        """Application checks are declared per project; nothing is inferred from service names."""
+        probes_path = compose_path.parent / "probes.yaml"
+        if not probes_path.is_file():
+            return None, probes_path
+        try:
+            document = YAML(typ="safe").load(probes_path.read_text())
+            return ProbeSpec.model_validate(document or {}), probes_path
+        except (YAMLError, ValidationError) as exc:
+            raise ValueError(f"probes.yaml không hợp lệ: {exc}") from exc
+
     async def build_plan(self, state):
         project, plan_id = state["project"], state["plan_id"]
         request, supplied = state.get("request", ""), state.get("compose_yaml")
@@ -47,6 +61,7 @@ class InfraService:
             else {"allowed": True, "code": "compose_input", "llm_calls": 0}
         )
         path = self.project_path(project)
+        probes, probes_path = self.project_probes(path)
         current = path.read_text()
         snapshot = await self.tools.call("inspect_project", {"project": project})
         previous = self.store.verified(project)
@@ -80,7 +95,7 @@ class InfraService:
                 source_model = await asyncio.to_thread(normalize, desired, path.parent, project)
                 validate_model(source_model, path.parent)
                 image_ids = await asyncio.to_thread(self.runtime.image_ids, source_model)
-                spec = InfrastructureSpec.from_compose(source_model, image_ids, policy)
+                spec = InfrastructureSpec.from_compose(source_model, image_ids, policy, probes)
                 break
             except (ValueError, KeyError, TypeError) as exc:
                 validation_history.append({"attempt": attempt + 1, "error": str(exc)})
@@ -118,7 +133,7 @@ class InfraService:
             previous_plan = self.store.get(previous["plan_id"])
             if set(previous_plan["source_model"]["services"]) - set(source_model["services"]):
                 raise ValueError("Demo chưa hỗ trợ xóa service. Hãy giữ service hiện có.")
-        fingerprints = source_fingerprints(path, source_model)
+        fingerprints = source_fingerprints(path, source_model, [probes_path])
         artifact_fingerprints = {}
         for service in spec.services.values():
             for volume in service.mounts:
@@ -162,23 +177,43 @@ class InfraService:
                     )
             changes.append({"service": name, "action": action, "detail": detail})
         probe_url = spec.probe_url
-        baseline = {}
-        baseline_status = "new_project"
         warnings = []
-        if previous:
-            previous_url = self.store.get(previous["plan_id"]).get("probe_url")
-            if previous_url:
-                try:
-                    async with httpx.AsyncClient(timeout=4, trust_env=False) as client:
-                        response = await client.get(previous_url + "/api/records")
-                        response.raise_for_status()
-                        baseline = {str(r["id"]): r["value"] for r in response.json()}
-                        baseline_status = "captured"
-                except Exception as exc:
-                    baseline_status = "unavailable"
-                    warnings.append(
-                        f"Không đọc được baseline dữ liệu trước triển khai: {exc}. Có thể khởi động lại, nhưng chưa thể xác minh bảo toàn dữ liệu; cần preview/verify lại sau khi ứng dụng hoạt động."
-                    )
+        previous_spec = previous["payload"].get("infrastructure_spec", {}) if previous else {}
+        if spec.probes is None:
+            warnings.append(
+                "Project chưa có probes.yaml: kế hoạch chỉ được kiểm chứng ở mức Docker (bản sao, image, RAM, port, network, mount, health); không kiểm tra HTTP, routing hay bảo toàn dữ liệu."
+            )
+            if previous_spec.get("probes") or previous_spec.get("probe_url"):
+                warnings.append(
+                    "Kế hoạch đã kiểm chứng trước có lớp kiểm chứng ứng dụng; kế hoạch này không còn. Kiểm tra lại probes.yaml trước khi duyệt."
+                )
+        elif spec.probes.records is None:
+            warnings.append(
+                "probes.yaml không khai báo records: không kiểm tra bảo toàn dữ liệu sau triển khai."
+            )
+        baseline = {}
+        baseline_status = "new_project" if spec.probes and spec.probes.records else "not_configured"
+        previous_url = self.store.get(previous["plan_id"]).get("probe_url") if previous else None
+        if baseline_status == "new_project" and previous_url:
+            records = spec.probes.records
+            try:
+                async with httpx.AsyncClient(timeout=4, trust_env=False) as client:
+                    response = await client.get(previous_url + records.path)
+                    response.raise_for_status()
+                    baseline = {str(r[records.id_field]): r[records.value_field] for r in response.json()}
+                    baseline_status = "captured"
+            except Exception as exc:
+                baseline_status = "unavailable"
+                warnings.append(
+                    f"Không đọc được baseline dữ liệu trước triển khai: {exc}. Có thể khởi động lại, nhưng chưa thể xác minh bảo toàn dữ liệu; cần preview/verify lại sau khi ứng dụng hoạt động."
+                )
+        planned_checks = [{"name": "Replica/image/port/RAM/network/mount/health"}]
+        if spec.probes:
+            planned_checks.append({"name": f"HTTP {spec.probes.health.path} qua {spec.probes.entry_service}"})
+            if spec.probes.routing:
+                planned_checks.append({"name": f"Routing tới mọi replica {spec.probes.routing.service}"})
+            if spec.probes.records:
+                planned_checks.append({"name": "Bảo toàn dữ liệu trước triển khai"})
         frozen = {
             "policy_revision": current_policy["revision"],
             "project": project,
@@ -221,12 +256,7 @@ class InfraService:
             "gateway": gateway,
             "validation_history": validation_history,
             "warnings": warnings,
-            "checks": [
-                {"name": "Replica/image/port/RAM/network/mount/health"},
-                {"name": "HTTP, routing mọi backend và bảo toàn dữ liệu"},
-            ]
-            if probe_url
-            else [{"name": "Replica/image/port/RAM/network/mount/health"}],
+            "checks": planned_checks,
         }
         if (
             previous

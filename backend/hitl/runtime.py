@@ -269,8 +269,10 @@ class DockerRuntime:
                 network.get("internal", False),
                 observed["internal"] if observed else None,
             )
-        base = spec.probe_url
-        if base:
+        probes = spec.probes
+        if probes:
+            base = spec.probe_url
+            entry = probes.entry_service
             with httpx.Client(timeout=5, trust_env=False) as http:
                 try:
                     readiness_attempts = 0
@@ -282,55 +284,66 @@ class DockerRuntime:
                     ):
                         with attempt:
                             readiness_attempts += 1
-                            response = http.get(base + "/health")
+                            response = http.get(base + probes.health.path)
                             response.raise_for_status()
-                            response.json()
+                            health = response.json()
                     check(
-                        "HTTP qua Nginx /health",
+                        f"HTTP {probes.health.path} qua {entry}",
                         200,
                         response.status_code,
                         f"HTTP sẵn sàng sau {readiness_attempts} lần đọc; không chạy lại deploy.",
                     )
-                    check("Backend kết nối database", "UP", response.json().get("database"))
-                    expected = sorted(
-                        c["hostname"] for c in snapshot["containers"] if c["service"] == "backend"
-                    )
-                    seen = set()
-                    deadline = time.monotonic() + 18
-                    while time.monotonic() < deadline:
-                        reply = http.get(base + "/api/instance", headers={"Connection": "close"})
-                        if reply.status_code == 200:
-                            seen.add(reply.json().get("instance"))
-                        if seen == set(expected):
-                            break
-                        time.sleep(0.2)
-                    check("Nginx chuyển request đến mọi backend", expected, sorted(seen))
-                    records = http.get(base + "/api/records")
-                    check("Đọc dữ liệu PostgreSQL qua ứng dụng", 200, records.status_code)
-                    by_id = (
-                        {str(r["id"]): r["value"] for r in records.json()}
-                        if records.status_code == 200
-                        else {}
-                    )
-                    baseline = plan.get("record_baseline", {})
-                    observed_records = by_id
-                    if plan.get("baseline_status") == "unavailable":
-                        checks.append(
-                            {
-                                "name": "Bảo toàn dữ liệu trước triển khai",
-                                "status": "skip",
-                                "expected": "baseline đọc được trước deploy",
-                                "actual": "Ứng dụng đã dừng nên chưa chụp được baseline",
-                                "detail": "Chưa cập nhật Verified State. Tạo preview mới khi ứng dụng đã hoạt động để kiểm chứng lại.",
-                            }
-                        )
-                    else:
+                    for key, value in probes.health.expect.items():
                         check(
-                            "Dữ liệu trước adjust được giữ nguyên",
-                            baseline,
-                            {k: by_id.get(k) for k in baseline},
-                            f"Đối chiếu {len(baseline)} bản ghi có trước khi lập kế hoạch.",
+                            f"{probes.health.path}: {key}",
+                            value,
+                            health.get(key) if isinstance(health, dict) else None,
                         )
+                    if probes.routing:
+                        routing = probes.routing
+                        expected = sorted(
+                            c["hostname"] for c in snapshot["containers"] if c["service"] == routing.service
+                        )
+                        seen = set()
+                        deadline = time.monotonic() + 18
+                        while time.monotonic() < deadline:
+                            reply = http.get(base + routing.path, headers={"Connection": "close"})
+                            if reply.status_code == 200:
+                                instance = reply.json().get(routing.field)
+                                if isinstance(instance, str):
+                                    seen.add(instance)
+                            if seen == set(expected):
+                                break
+                            time.sleep(0.2)
+                        check(f"{entry} chuyển request đến mọi {routing.service}", expected, sorted(seen))
+                    if probes.records:
+                        records = probes.records
+                        reply = http.get(base + records.path)
+                        check(f"Đọc {records.path} qua ứng dụng", 200, reply.status_code)
+                        by_id = (
+                            {str(r[records.id_field]): r[records.value_field] for r in reply.json()}
+                            if reply.status_code == 200
+                            else {}
+                        )
+                        observed_records = by_id
+                        baseline = plan.get("record_baseline", {})
+                        if plan.get("baseline_status") == "unavailable":
+                            checks.append(
+                                {
+                                    "name": "Bảo toàn dữ liệu trước triển khai",
+                                    "status": "skip",
+                                    "expected": "baseline đọc được trước deploy",
+                                    "actual": "Ứng dụng đã dừng nên chưa chụp được baseline",
+                                    "detail": "Chưa cập nhật Verified State. Tạo preview mới khi ứng dụng đã hoạt động để kiểm chứng lại.",
+                                }
+                            )
+                        else:
+                            check(
+                                "Dữ liệu trước triển khai được giữ nguyên",
+                                baseline,
+                                {k: by_id.get(k) for k in baseline},
+                                f"Đối chiếu {len(baseline)} bản ghi có trước khi lập kế hoạch.",
+                            )
                 except Exception as exc:
                     check("HTTP application probes", "reachable and valid JSON", str(exc))
         return {

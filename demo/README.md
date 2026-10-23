@@ -20,6 +20,11 @@ API through `http://127.0.0.1:8080`:
   `{ "id": 1, "value": "survives-adjust", "createdAt": "..." }`.
 - `GET /api/records`: an array of those records ordered by ID.
 
+`examples/webapp/probes.yaml` maps these endpoints to the verifier: `/health` must report
+`database: UP`, `/api/instance` proves every replica receives traffic through Nginx, and
+`/api/records` provides the persistence baseline. The verifier itself knows nothing about
+this fixture; another application declares its own `probes.yaml` next to its Compose file.
+
 An adjust from two replicas at 256 MiB to three replicas at 512 MiB should retain
 the original records. Nginx resolves Docker DNS every two seconds so added backend
 replicas enter the upstream without a handwritten list or Nginx recreation.

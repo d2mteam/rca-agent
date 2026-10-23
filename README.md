@@ -70,7 +70,7 @@ docker pull postgres:16-alpine
 uv run infra serve
 ```
 
-Mở **http://127.0.0.1:8765**. Chọn Codex AI, tạo preview, đọc diff/spec rồi duyệt. Backend phục vụ luôn bản React đã build. Lần đầu tự sao chép Compose mẫu vào `.hitl/projects/hitl-demo/`; các lần sau giữ chỉnh sửa tại đó.
+Mở **http://127.0.0.1:8765**. Chọn Codex AI, tạo preview, đọc diff/spec rồi duyệt. Backend phục vụ luôn bản React đã build. Lần đầu tự sao chép Compose mẫu và `probes.yaml` vào `.hitl/projects/hitl-demo/`; các lần sau giữ chỉnh sửa tại đó.
 
 Yêu cầu demo:
 
@@ -80,7 +80,7 @@ Sau khi deploy, ghi một bản ghi qua `POST http://127.0.0.1:8080/api/records`
 
 > Tăng backend lên 3 bản sao, giới hạn mỗi bản 512 MiB RAM; giữ nguyên địa chỉ truy cập và dữ liệu hiện có.
 
-Verifier kiểm tra số bản sao, image ID, RAM, port, network, mount, trạng thái/healthcheck; gọi HTTP qua Nginx để kiểm tra database, mọi backend đều nhận request và bản ghi trước adjust vẫn còn. Chỉ Nginx được publish trên loopback; PostgreSQL dùng volume riêng và network internal.
+Verifier kiểm tra số bản sao, image ID, RAM, port, network, mount, trạng thái/healthcheck; sau đó theo `probes.yaml` của project gọi HTTP qua Nginx để kiểm tra database, mọi backend đều nhận request và bản ghi trước adjust vẫn còn. Chỉ Nginx được publish trên loopback; PostgreSQL dùng volume riêng và network internal.
 
 CLI dùng cùng backend và workflow:
 
@@ -106,11 +106,32 @@ Policy áp dụng chung cho host. Khi duyệt phiên bản mới, kế hoạch c
 
 - **Trước LLM — `backend/hitl/gateway.py`:** luật cố định kiểm tra phạm vi, thao tác phá hủy, port nhạy cảm và truy cập host. Yêu cầu bị chặn không gọi model hoặc Docker. Đây là bộ luật cho phạm vi demo, chưa phải bộ hiểu mọi cách diễn đạt ngôn ngữ tự nhiên.
 - **Sau LLM — `backend/hitl/domain.py`, `policy.py`:** allowlist Compose, `docker compose config`, Pydantic kiểm tra cấu trúc/ngữ nghĩa: image, replicas, tên, dependencies có thật/không vòng lặp, port không trùng và tài nguyên thuộc project. Lỗi trả về Planner, tối đa 3 lần tạo/kiểm tra đề xuất.
-- **`InfrastructureSpec` là cấu hình mong muốn chuẩn hóa:** Compose thực thi được render từ spec, preview có tab spec, verifier đọc spec và Verified State lưu spec. Compose chỉnh tay là đầu vào nhập lại qua cùng pipeline.
+- **`InfrastructureSpec` là cấu hình mong muốn chuẩn hóa:** Compose thực thi được render từ spec, preview có tab spec, verifier đọc spec và Verified State lưu spec. Spec cũng giữ snapshot `probes.yaml` của project, xem phần kiểm chứng ứng dụng bên dưới. Compose chỉnh tay là đầu vào nhập lại qua cùng pipeline.
 
 LangGraph giữ checkpoint SQLite tại bước phê duyệt. Planner chỉ có ba công cụ đọc được cho phép; custom MCP server chứa executor và verifier. Executor tự kiểm tra phê duyệt đã lưu, hash artifact/spec, source và runtime trước khi chạy Compose. `approved: true` trong đầu ra AI không cấp quyền. Bản preview đóng băng image ID và nội dung file bind; sửa source hoặc runtime làm kế hoạch cũ hết hiệu lực.
 
 Nhật ký lưu cả thành công và thất bại. **Apply thành công khác với Verify đạt.** Verified State chỉ cập nhật khi mọi kiểm tra đạt. Nếu ứng dụng đã tắt nên không đọc được baseline dữ liệu, preview cảnh báo; có thể duyệt khởi động lại nhưng chưa xác nhận bảo toàn dữ liệu. Tạo preview mới khi ứng dụng hoạt động để kiểm chứng trạng thái hiện tại; việc này không chứng minh hồi tố lần khởi động trước không mất dữ liệu.
+
+## Kiểm chứng ứng dụng theo project
+
+Verifier luôn kiểm tra mức Docker: số bản sao, image ID, RAM, port, network, mount, trạng thái và healthcheck. Lớp kiểm chứng ứng dụng (HTTP qua cửa vào, routing tới mọi replica, bảo toàn dữ liệu) do file `probes.yaml` đặt cạnh `compose.yaml` của project khai báo. Code backend không biết gì về ứng dụng cụ thể; không có file này thì preview cảnh báo và kế hoạch chỉ được kiểm chứng ở mức Docker. Demo kèm `examples/webapp/probes.yaml` cho fixture Java:
+
+```yaml
+entry_service: nginx        # service publish cổng HTTP làm cửa vào
+health:
+  path: /health             # GET phải trả 200 và JSON; các trường trong expect phải khớp
+  expect: { database: UP }
+routing:                    # tùy chọn: mọi replica của service phải nhận request qua cửa vào
+  path: /api/instance
+  field: instance           # giá trị trường này phải là hostname của container
+  service: backend
+records:                    # tùy chọn: mảng JSON để chụp baseline trước deploy và đối chiếu sau
+  path: /api/records
+  id_field: id
+  value_field: value
+```
+
+`entry_service` phải publish ít nhất một port; `routing.service` phải là service trong Compose; chỉ hỗ trợ GET trả JSON, không xác thực. Spec của kế hoạch giữ snapshot probes và `probes.yaml` nằm trong fingerprint nguồn, nên sửa file sau preview làm kế hoạch stale. Baseline dữ liệu được đọc từ cửa vào của kế hoạch đã kiểm chứng trước; không khai báo `records` thì không có kiểm tra bảo toàn dữ liệu và preview ghi rõ. Nếu kế hoạch trước có lớp kiểm chứng ứng dụng mà kế hoạch mới không còn, preview cảnh báo riêng. Cài đặt cũ đã có `.hitl/projects/hitl-demo/` cần chép thêm `examples/webapp/probes.yaml` vào đó vì thư mục này không bị ghi đè.
 
 ## Kiểm thử
 
@@ -129,4 +150,4 @@ Smoke test thực tế kiểm tra chặn trước LLM, từ chối không đổi
 
 Một Docker host local; image phải có sẵn; project được đăng ký trong `.hitl/projects/` và tên bắt đầu `hitl-`. Chỉ hỗ trợ subset Compose đã allowlist; không tự chạy build, shell tùy ý, destroy, rollback hoặc xóa volume. MCP kết nối trực tiếp custom tool server qua stdio, không dùng Docker MCP Gateway chính thức. Khi process bị ngắt giữa apply, ghi nhận chưa hoàn tất và yêu cầu kế hoạch mới, không tự replay thao tác Docker.
 
-HTTP probes hiện dành riêng cho API của fixture Java. Credentials trong Compose chỉ dùng demo local. UI/API bind loopback, chưa phải dịch vụ nhiều người dùng. Trạng thái, log và cấu hình nằm trong `.hitl/`; không đưa thư mục này lên Git.
+Kiểm chứng ứng dụng chỉ gồm GET JSON không xác thực qua một cửa vào HTTP do `probes.yaml` khai báo; project không có file này chỉ được kiểm chứng ở mức Docker. Credentials trong Compose chỉ dùng demo local. UI/API bind loopback, chưa phải dịch vụ nhiều người dùng. Trạng thái, log và cấu hình nằm trong `.hitl/`; không đưa thư mục này lên Git.
