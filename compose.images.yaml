@@ -1,0 +1,9 @@
+# Image preparation only. These services are deployed through the approval UI.
+services:
+  backend:
+    image: hitl-demo-backend:1.0.0
+    build: ./demo/backend
+  nginx:
+    image: nginx:1.28-alpine
+  postgres:
+    image: postgres:16-alpine

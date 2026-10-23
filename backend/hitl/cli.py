@@ -6,12 +6,14 @@ import typer
 from rich.console import Console
 from rich.syntax import Syntax
 
+from hitl.settings import Settings
+
 app = typer.Typer(help="Docker HITL: dry-run, deploy, adjust. Backend mặc định http://127.0.0.1:8765")
 console = Console()
 
 
 def request(method, path, body=None):
-    with httpx.Client(base_url="http://127.0.0.1:8765", timeout=540, trust_env=False) as client:
+    with httpx.Client(base_url=f"http://127.0.0.1:{Settings().port}", timeout=540, trust_env=False) as client:
         response = client.request(method, path, json=body)
         if response.is_error:
             console.print(response.text, style="red")
@@ -83,4 +85,5 @@ def deploy(plan_id: str, approve_hash: str | None = None):
 def serve():
     import uvicorn
 
-    uvicorn.run("hitl.api:app", host="127.0.0.1", port=8765)
+    settings = Settings()
+    uvicorn.run("hitl.api:app", host=settings.host, port=settings.port)
