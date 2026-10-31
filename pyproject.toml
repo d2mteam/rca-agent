@@ -1,0 +1,14 @@
+[project]
+name = "openrca-agent"
+version = "0.1.0"
+description = "Root-cause analysis agent evaluated on the OpenRCA Bank dataset"
+requires-python = ">=3.13"
+dependencies = ["duckdb>=1.2"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+baro = ["fse-baro>=0.2.2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
