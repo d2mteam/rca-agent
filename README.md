@@ -351,3 +351,4 @@ Trong lần rà soát này, **28 tests hiện có đều pass** bằng
 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider`.
 Đã đọc code và chấm lại artifacts có sẵn; chưa chạy lại ingestion toàn bộ dữ
 liệu hoặc gọi LLM để tạo benchmark mới. Thay đổi của lần rà soát chỉ ở README.
+# rca-agent
