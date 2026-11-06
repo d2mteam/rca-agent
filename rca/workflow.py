@@ -4,10 +4,10 @@
 2. Symptoms   business KPIs per minute, summarised by code.
 3. Localise   two tools on the same window:
               - BARO: BOCPD change point + RobustScorer over metrics (statistics);
-                its scores are also the per-candidate evidence. With multi_source,
-                log lines and span counts/latency per minute join the metrics.
-              - Graph: MicroRank over the trace graph, plus replicas of each layer of
-                the dependency graph compared by their share of traffic
+                its scores are also the per-candidate evidence
+              - Graph: exclusive time per component from the traces (rca.exclusive_time),
+                plus replicas of each layer of the dependency graph compared by their
+                share of traffic
 4. Decide     code lists BARO's results for every candidate; the LLM picks
               component, reason and onset minute as JSON.
 5. Verify     code checks each pick against the evidence and sends the LLM back
@@ -23,9 +23,10 @@ from datetime import datetime, timedelta
 
 import duckdb
 
-from rca import bank, baro, microrank, tools
+from rca import bank, baro, exclusive_time, tools
 from rca.cases import CST, Case
 from rca.scoring import TIME_FORMAT, Answer
+from rca.statistical import reason_for
 
 # Replicas sharing a layer of the dependency graph; spans count traffic for the
 # traced layers, access-log lines for apache.
@@ -49,6 +50,12 @@ FAMILIES = (
     ("trace span latency (ms)", r"\|trace_latency_ms$", {"network latency", "network packet loss"}),
 )
 NETWORK = {"network latency", "network packet loss"}
+# Reasons a rise in exclusive time supports: work inside a component, or the way to it.
+TRACE_REASONS = {
+    "processing": frozenset({"high CPU usage", "high JVM CPU load", "JVM Out of Memory (OOM) Heap",
+                             "high memory usage", "high disk I/O read usage"}),
+    "network in": frozenset(NETWORK),
+}
 
 RULES = """Backend rules:
 - OS CPU utilisation up while JVM CPU load stays flat -> "high CPU usage"; JVM CPU load up -> "high JVM CPU load".
@@ -58,6 +65,9 @@ RULES = """Backend rules:
 - A replica losing its share of traffic (its siblings take it over), FIN-WAIT or connections dropping, no CPU/memory/disk change -> a network fault on that replica.
   The siblings that receive the extra traffic are healthy, even if their load rises.
 - A metric that was already abnormal before the window, or a single-sample spike, is not the root cause.
+- Exclusive time is the time a component spends itself, not waiting on the components it calls: a
+  caller waiting on a slow callee keeps its exclusive time. "processing" up means the work inside the
+  component slowed (CPU, JVM, memory, disk); "network in" up means requests took longer to reach it.
 - The onset is the first minute the root-cause component changed, not when users noticed."""
 
 
@@ -109,7 +119,7 @@ def baro_tool(ranked: list[baro.Ranked], split: int, case: Case, top: int = 8) -
     lines, seen = [], set()
     for r in ranked:
         component, _, kpi = r.column.partition("|")
-        if component not in bank.COMPONENTS or component in seen or baro.reason_of(kpi) is None:
+        if component not in bank.COMPONENTS or component in seen or reason_for(kpi) is None:
             continue
         seen.add(component)
         lines.append(f"{component}: {kpi.split('_', 2)[-1]} {r.centre:.2f} -> {r.peak:.2f} "
@@ -153,17 +163,21 @@ def _share_drops(con: duckdb.DuckDBPyConnection, case: Case) -> list[tuple[str, 
     return drops
 
 
-def graph_tool(con: duckdb.DuckDBPyConnection, case: Case, top: int = 5) -> tuple[list[str], list[str], list]:
-    ranks = microrank.rank_components(con, case)
-    best = ranks[0][1] if ranks else 0
-    micro = [f"{c}: {s / best:.2f}" for c, s in ranks[:top]] if best else []
+def graph_tool(con: duckdb.DuckDBPyConnection, case: Case, top: int = 8) -> tuple[list[str], list[str], list, list]:
+    """Exclusive-time changes and replica traffic-share drops, as prompt lines and as records."""
+    traced = exclusive_time.changes(con, case)
+    lines = [
+        f"{c.component}: {c.kind} {c.normal_ms:.0f} -> {c.peak_ms:.0f} ms "
+        f"(robust score {c.score:.0f}, from {_hm(c.start)} to {_hm(c.end)})"
+        for c in traced[:top]
+    ]
     drops = _share_drops(con, case)
     shift = [
         f"{c} kept only {kept:.0%} of its normal share of {'/'.join(layer)} traffic from {_hm(a)} to {_hm(b)}; "
         f"{', '.join(x for x in layer if x != c)} took it over"
         for c, a, b, kept, layer in drops
     ]
-    return micro, shift, drops
+    return lines, shift, drops, traced
 
 
 def evidence(ranked: list[baro.Ranked], component: str) -> list[Change]:
@@ -254,7 +268,7 @@ def answers_of(case: Case, picks: list[dict]) -> list[Answer]:
     return [Answer(_onset(case, p["onset_minute"]).strftime(TIME_FORMAT), p["component"], p["reason"]) for p in picks]
 
 
-def build(con: duckdb.DuckDBPyConnection, case: Case, multi_source: bool = False) -> tuple[str, dict, list, Report]:
+def build(con: duckdb.DuckDBPyConnection, case: Case) -> tuple[str, dict, list, Report]:
     """Steps 1-3 and the evidence: the prompt for the deciding LLM, plus what verify needs."""
     report = Report(case.case_id)
     n = len(case.faults)  # the query states how many failures there are
@@ -267,20 +281,28 @@ def build(con: duckdb.DuckDBPyConnection, case: Case, multi_source: bool = False
 
     report.symptoms = symptoms(con, case)
     lap("2 symptoms")
-    split, ranked = baro.rank_series(con, case, multi_source)
+    split, ranked = baro.rank_series(con, case)
     baro_head, report.baro = baro_tool(ranked, split, case)
     lap("3a baro")
-    micro, shift, drops = graph_tool(con, case)
-    report.graph = micro + shift
+    traced_lines, shift, drops, traced = graph_tool(con, case)
+    report.graph = traced_lines + shift
     lap("3b graph")
 
+    # Each source puts forward its components in turn, so no source fills every place.
+    sources = [[line.split(":")[0] for line in report.baro], [c.component for c in traced], [d[0] for d in drops]]
     candidates = []
-    for line in report.baro + micro + [d[0] for d in drops]:
-        c = line.split(":")[0]
-        if c in bank.COMPONENTS and c not in candidates:
-            candidates.append(c)
-    candidates = candidates[:8]
-    evidence_of = {c: evidence(ranked, c) for c in candidates}
+    for rank in range(max(map(len, sources), default=0)):
+        for ranked_components in sources:
+            if rank < len(ranked_components) and ranked_components[rank] not in candidates:
+                candidates.append(ranked_components[rank])
+    candidates = [c for c in candidates if c in bank.COMPONENTS][:8]
+    evidence_of = {
+        c: evidence(ranked, c) + [
+            Change(f"exclusive {t.kind} time (traces)", TRACE_REASONS[t.kind], t.normal_ms, t.peak_ms, t.start, t.score)
+            for t in traced if t.component == c
+        ]
+        for c in candidates
+    }
     report.evidence = {c: _describe(e) for c, e in evidence_of.items()}
     lap("evidence")
 
@@ -293,17 +315,17 @@ Reasons (use one exactly): {"; ".join(bank.REASONS)}.
 SYMPTOMS
 {report.symptoms}
 
-TOOL 1 - {"MULTI-SOURCE BARO (metrics, log lines and trace spans" if multi_source else "BARO (metrics"}: change points, strongest change per component)
+TOOL 1 - BARO (metrics: change points, strongest change per component)
 {baro_head}
 {chr(10).join(report.baro) or "nothing"}
 
 TOOL 2 - GRAPH
-MicroRank over the trace graph (1.00 = most suspicious; covers IG, Tomcat, MG only):
-{chr(10).join(micro) or "no result"}
+Exclusive time from the traces, rises of 3 or more against the hour before (covers IG, Tomcat, MG only):
+{chr(10).join(traced_lines) or "no rise"}
 Replicas of the same layer compared by share of traffic:
 {chr(10).join(shift) or "no replica lost its share of traffic"}
 
-BARO RESULTS PER CANDIDATE (series that rose, robust score >= 3)
+EVIDENCE PER CANDIDATE (BARO series and exclusive times that rose, robust score >= 3)
 {chr(10).join(f"{c}:{chr(10)}{d}" for c, d in report.evidence.items())}
 
 {RULES}
@@ -313,9 +335,9 @@ Give {n} answer(s): the root-cause component, the reason, and the onset minute (
 
 
 def run(con: duckdb.DuckDBPyConnection, case: Case, model: str, url: str = "http://localhost:11434",
-        retries: int = 2, multi_source: bool = False) -> tuple[list[Answer], Report]:
+        retries: int = 2) -> tuple[list[Answer], Report]:
     """The whole workflow with a local Ollama model deciding."""
-    prompt, evidence_of, drops, report = build(con, case, multi_source)
+    prompt, evidence_of, drops, report = build(con, case)
     n = len(case.faults)
     messages = [{"role": "user", "content": prompt}]
     for attempt in range(retries + 1):

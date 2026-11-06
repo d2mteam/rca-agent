@@ -10,7 +10,9 @@ bộ chấm rõ ràng. Baseline, agent tự gọi công cụ và workflow cố �
 để so sánh các cách suy luận. Phần điều phối LLM, kiểm tra đáp án và quản lý
 thí nghiệm vẫn ở mức prototype; chưa đủ cơ sở để dùng cho vận hành production.
 
-Tài liệu phản ánh mã nguồn và artifacts trong workspace ngày **30/10/2026**.
+Tài liệu phản ánh mã nguồn ngày **04/11/2026**, sau khi dọn các nhánh thử
+nghiệm (agent Ollama, Codex, TraceRCA, TORAI, multi-source BARO). Các nhánh đó
+còn lưu ở branch `backup/experiments-2026-11-04`.
 Tên thư mục vẫn là `human-in-the-loop-infra`, nhưng code hiện tại là package
 Python `rca`, chạy qua CLI. HITL console cũ nằm ở branch `archive/hitl-infra`
 (tag `hitl-infra-final`). Bản hiện tại chưa có UI, dịch vụ API, bước phê duyệt
@@ -20,7 +22,8 @@ thủ công.
 ## 1. Kiến trúc tổng quan
 
 Ứng dụng chạy trong một tiến trình Python, xử lý tuần tự từng case. DuckDB
-truy vấn Parquet tại máy; Ollama là dịch vụ riêng, chỉ cần cho hai nhánh LLM.
+truy vấn Parquet tại máy. LLM nằm ngoài package: một agent (ví dụ Claude) gọi
+CLI `tool` hoặc `flow`, hoặc lệnh `workflow` gọi Ollama ở bước chọn đáp án.
 Không có database server hay hàng đợi trong luồng hiện tại.
 
 ```mermaid
@@ -30,21 +33,20 @@ flowchart TD
     P --> F["Parquet theo ngày, ts thống nhất"]
     F --> D["DuckDB: 4 views"]
     C --> B["Baseline"]
-    C --> A["Agent tự gọi công cụ"]
+    C --> A["Agent ngoài gọi CLI tool"]
     C --> W["Workflow cố định"]
     C --> S["scoring.py + report.py"]
     D --> B
     D --> U["tools.py: công cụ điều tra"]
     U --> A
     D --> W
-    A <--> O["Ollama /api/chat"]
-    W <--> O
+    W <--> O["LLM chọn đáp án: Ollama hoặc agent qua flow"]
     B --> J["predictions.jsonl"]
     A --> J
     W --> J
     J --> S
-    A --> L["answers/ + transcripts/"]
-    W --> R["reports/: evidence, attempts, answers"]
+    A --> L["answers/"]
+    W --> R["reports/ hoặc attempts/"]
 ```
 
 Oracle, random và import đáp án OpenRCA chỉ cần cases; các baseline thống kê
@@ -61,13 +63,12 @@ kiểu dữ liệu riêng.
 | [rca/baselines.py](rca/baselines.py) | Oracle, random, import predictions lưu sẵn của OpenRCA. |
 | [rca/statistical.py](rca/statistical.py) | Xếp hạng metric bằng z-score/IQR; ánh xạ KPI sang reason. |
 | [rca/baro.py](rca/baro.py) | Tích hợp `fse-baro`: BOCPD tìm điểm thay đổi, robust score xếp hạng metric. |
-| [rca/microrank.py](rca/microrank.py) | Localisation từ trace bằng PageRank và DStar2 theo hướng MicroRank. |
-| [rca/tracerca.py](rca/tracerca.py) | Localisation theo hướng TraceRCA, dùng trace bất thường và Jaccard. |
-| [rca/tools.py](rca/tools.py) | Công cụ điều tra dùng chung cho CLI/agent; ghi đáp án qua `submit`. |
-| [rca/ollama_agent.py](rca/ollama_agent.py) | Vòng lặp để LLM tự chọn công cụ và submit. |
+| [rca/exclusive_time.py](rca/exclusive_time.py) | Tool 2 của workflow: exclusive time từng component theo phút (theo CRISP), so với giờ trước. |
+| [rca/microrank.py](rca/microrank.py) | MicroRank theo đúng các phương trình của bài báo (Eq. 1, 2, 4–8): PageRank cá nhân hóa trên đồ thị operation–trace, rồi Ochiai. Dùng làm baseline và trong tool `traces`. |
+| [rca/tools.py](rca/tools.py) | Công cụ điều tra cho agent ngoài gọi qua CLI; ghi đáp án qua `submit`. |
 | [rca/workflow.py](rca/workflow.py) | Code thu thập evidence; LLM chọn đáp án; code kiểm tra và yêu cầu sửa. |
 | [rca/scoring.py](rca/scoring.py), [rca/report.py](rca/report.py) | Đọc/ghi predictions, chấm từng trường, tổng hợp theo case, độ khó và reason. |
-| [tests/](tests/) | Kiểm thử parser, scorer, chuyển đổi telemetry và KPI → reason. |
+| [tests/](tests/) | Kiểm thử parser, scorer, chuyển đổi telemetry, KPI → reason, exclusive time và MicroRank (tái tạo ví dụ số trong bài báo). |
 
 ## 2. Dữ liệu và hợp đồng giữa các lớp
 
@@ -79,7 +80,7 @@ kiểu dữ liệu riêng.
 | 2021-03-09 | Đánh giá | 21 |
 | 2021-03-25 | Đánh giá | 19 |
 
-`query.csv` chứa 136 câu hỏi Bank; `baseline`, `agent`, `workflow`, `score`
+`query.csv` chứa 136 câu hỏi Bank; `baseline`, `workflow`, `score`
 mặc định chọn hai ngày đánh giá trên: **40 câu hỏi, 44 lỗi**. Bốn case có hai
 lỗi là `bank-104`, `bank-109`, `bank-121`, `bank-131`. Lệnh `cases` không truyền
 ngày sẽ liệt kê toàn bộ câu hỏi, bao gồm ground truth.
@@ -120,9 +121,9 @@ data/
 runs/<run>/
   predictions.jsonl           # Đầu vào chung của scorer
   findings.jsonl              # Top 5 findings/case của z-score hoặc IQR
-  answers/<case>.json         # Đáp án từ tool submit / tool-calling agent
-  transcripts/<case>.jsonl    # Lượt trả lời và kết quả tool của agent
-  reports/<case>.json         # Evidence, các lần thử và đáp án của workflow
+  answers/<case>.json         # Đáp án từ tool submit
+  reports/<case>.json         # Evidence, các lần thử và đáp án của workflow (Ollama)
+  attempts/<case>.jsonl       # Các lần nộp qua flow submit và kết quả kiểm tra
 ```
 
 Các file tùy theo nhánh chạy, không phải run nào cũng có đủ. `data/`, `runs/`
@@ -152,45 +153,69 @@ Z-score/IQR hỗ trợ `before` (một giờ trước) hoặc `normal-day` (cùn
 05/03, mở rộng 30 phút mỗi phía). Với `before`, chỉ khi không có findings mới
 fallback sang `normal-day`. BARO không có fallback normal-day tương đương.
 
-### Agent tự gọi công cụ (`agent`)
+### Agent tự gọi công cụ (`tool`)
 
-LLM nhận câu hỏi, topology Bank và danh sách component/reason. Model tự gọi
-`overview`, `anomalies`, `series`, `traces`, `logs`, rồi `submit` cho từng lỗi.
-Dispatcher thực thi các hàm đã định nghĩa. `submit` kiểm tra định dạng thời
-gian và enum component/reason, ghi JSON và tổng hợp lại `predictions.jsonl`.
+Một agent bên ngoài (ví dụ Claude) đọc câu hỏi bằng `tool question`, rồi tự
+điều tra qua CLI. Công cụ không mang kiến thức về ý nghĩa tín hiệu; ngữ nghĩa
+do agent tự suy ra.
 
-Mặc định có 14 vòng điều tra cộng một vòng yêu cầu submit cuối; một vòng có
-thể có nhiều tool calls. Model mặc định là `qwen3:4b-instruct-2507-q4_K_M`,
-context 16.384 tokens, temperature 0, HTTP timeout 900 giây mỗi lần gọi.
+- Công cụ thô: `overview`, `calls` (cặp gọi -> bị gọi từ trace), `series`, `logs` (grep).
+- Công cụ phân phối: `baro` (mọi chuỗi metric), `exclusive` (exclusive time),
+  `traces` (MicroRank, trace bất thường = chậm hơn p99 cùng loại hoặc có lời gọi thất bại).
+- Vòng giả thuyết (`rca/hypotheses.py`, mặc định): agent ghi giả thuyết bằng
+  `tool hypothesis <case> add|test|list` kèm điều phải thấy nếu đúng / nếu sai;
+  `submit` chỉ nhận đáp án khớp một giả thuyết đã được ủng hộ và khi có ít nhất
+  một giả thuyết khác đã bị bác. `tool --protocol free ...` tắt vòng này.
+- Cửa sổ bình thường `normal-YYYY_MM_DD-HHMM` (cách mọi cửa sổ đề bài ít nhất
+  một giờ) để khảo sát hệ thống lúc khỏe; `profiles/bank.md` là hồ sơ một agent
+  Sonnet viết từ 6 cửa sổ như vậy.
 
-Tool output gửi cho model bị cắt ở 4.000 ký tự; transcript chỉ lưu tối đa
-1.500 ký tự mỗi kết quả tool và không lưu đầy đủ prompt đầu vào. Agent có
-thể kết thúc mà chưa submit đủ; `submit` chưa kiểm tra thời gian nằm trong
-cửa sổ câu hỏi.
+`submit` kiểm tra định dạng thời gian và enum component/reason, ghi JSON và tổng
+hợp lại `predictions.jsonl`. Package không chứa vòng lặp gọi LLM cho nhánh này;
+luật "không đọc dữ liệu đáp án" nằm trong lời dặn cho agent.
+
+Kết quả Sonnet (effort medium), mỗi cấu hình chạy một lần, 2026-11-06:
+
+| Bộ ca | Vòng giả thuyết | Tự do (cùng ngân sách) | z-score |
+|---|---|---|---|
+| 20 ca held-out | 18/20 | chưa chạy | 6/20 |
+| 30 ca held-out mới | 19/30 | 15/30 | 10/30 |
 
 ### Workflow cố định (`workflow`)
 
 1. **Symptoms:** tổng hợp success rate và response time của nghiệp vụ.
-2. **Localise:** BARO trên metrics; MicroRank trên trace graph; tìm replica
-   giữ dưới 50% traffic share bình thường ít nhất hai phút liên tiếp.
-   Apache dùng access logs, các layer còn lại dùng traces để so sánh share.
-3. **Evidence:** ghép candidates theo thứ tự BARO trước, graph sau, cắt còn
-   tối đa 8; gom metric score ≥ 3 theo nhóm CPU, memory, disk, network.
-4. **Decide:** Ollama trả JSON gồm component, reason, onset minute, giải thích
-   và confidence. Context cố định 8.192 tokens, temperature 0.
+2. **Localise:** BARO trên metrics; exclusive time từ traces (thời gian mỗi
+   component tự xử lý và thời gian request đi tới nó); tìm replica giữ dưới
+   50% traffic share bình thường ít nhất hai phút liên tiếp. Apache dùng
+   access logs, các layer còn lại dùng traces để so sánh share.
+3. **Evidence:** mỗi nguồn (BARO, exclusive time, traffic share) lần lượt góp
+   một component cho tới đủ 8; mỗi candidate kèm metric score ≥ 3 theo nhóm
+   CPU, memory, disk, network và các exclusive time tăng.
+4. **Decide:** lệnh `workflow` gọi Ollama, trả JSON gồm component, reason,
+   onset minute, giải thích và confidence (context 8.192 tokens, temperature 0).
+   Hoặc một agent ngoài đóng vai LLM: `flow prompt <case>` in prompt, `flow
+   submit <case> --answers '<JSON>'` kiểm tra rồi ghi đáp án.
 5. **Verify/retry:** kiểm tra thời gian trong cửa sổ, bằng chứng phù hợp reason,
    onset cách bằng chứng không quá 300 giây; cho sửa tối đa hai lần.
 6. **Persist:** ghi report và predictions, kể cả khi lần cuối còn lỗi kiểm tra.
    Vì vậy output chưa thể coi là đáp án đã được xác minh.
 
-TraceRCA chỉ nằm trong tool `traces`, không nằm trong workflow cố định.
-MicroRank/TraceRCA ở đây được thích nghi với Bank: thiếu tên operation nên
-phân biệt theo component và phía outgoing/server của span. Traces phủ IG,
+Exclusive time theo CRISP (USENIX ATC 2022): mỗi span chỉ giữ phần thời gian
+không chờ span con, nên máy chỉ ngồi chờ máy khác không bị đổ lỗi. Trace Bank
+gần như tuần tự và ba ngày 23–25/3 chỉ có timestamp tới giây, nên critical
+path là cả trace và exclusive time = duration − tổng duration span con. Lời
+gọi timeout không có span phía nhận thì không biết gọi tới đâu nên bị bỏ qua.
+
+MicroRank được thích nghi với Bank: thiếu tên operation nên phân biệt theo
+component và phía outgoing/server của span. Bài báo không ghi d, ω và số vòng
+lặp; code lấy theo code của tác giả (0,85; 0,01; 25 vòng). Traces phủ IG,
 Tomcat, MG và docker; apache, Mysql, Redis phải dựa vào nguồn khác.
 
 Mức tham chiếu chưa đồng nhất: `overview`/`series`/symptoms/traffic share dùng
 giờ trước nếu có `metric_app`, nếu thiếu thì dùng ngày bình thường; hai phương
 pháp trace chỉ dùng giờ trước. Ranking rỗng không đồng nghĩa không có sự cố.
+Eq. 1 của MicroRank cộng duration của mọi span (span cha đã bao span con), nên
+trên Bank thường gần như không trace nào bị coi là bất thường.
 
 ## 4. Chấm điểm và kết quả đang có
 
@@ -205,9 +230,10 @@ Scorer triển khai các quy tắc được mô tả theo OpenRCA:
   không phải tỷ lệ gộp mọi trường. Task 1–3/easy, 4–6/middle, 7/hard.
 - Case thiếu prediction vẫn nằm trong mẫu số và được chấm 0.
 
-Snapshot tính lại từ predictions trong workspace ngày 30/10/2026. Các run
-không có manifest gắn với revision/prompt/model digest, nên bảng phản ánh
-artifacts đã lưu, không chứng minh code hiện tại sẽ tái tạo y hệt.
+Snapshot tính ngày 30/10/2026 từ predictions đã lưu; thư mục `runs/` đã được
+xóa ngày 04/11/2026, các baseline chạy lại được bằng lệnh ở mục 6. Các run
+không có manifest gắn với revision/prompt/model digest, nên bảng không chứng
+minh code hiện tại sẽ tái tạo y hệt.
 
 | Run đủ 40 case | Giải đúng | Partial |
 |---|---:|---:|
@@ -221,26 +247,16 @@ artifacts đã lưu, không chứng minh code hiện tại sẽ tái tạo y h�
 | `iqr-normal-day` | 3/40 | 13,8% |
 | `zscore-normal-day` | 2/40 | 13,1% |
 
-`agent-tools` là nơi lưu đáp án qua CLI/tool submit; tên thư mục không xác
-định ai hoặc mô hình nào đã tạo đáp án. Không dùng kết quả này để khẳng định
-chất lượng agent Ollama hay workflow. Oracle cũng không phải đối thủ RCA thực tế.
-
-| Run LLM chưa phủ đủ tập đánh giá | Case có prediction | Solved trên phần có prediction | Partial trên phần có prediction |
-|---|---:|---:|---:|
-| `ollama-qwen3_4b-instruct-2507-q4_K_M` | 14/40 | 1/14 | 17,9% |
-| `workflow-qwen3_4b-instruct-2507-q4_K_M` | 10/40 | 3/10 | 33,3% |
-
-Trên 10 case chung, agent đạt 0/10 (partial 15,0%), workflow đạt 3/10
-(partial 33,3%). Tập thử nhỏ, chưa có cơ sở xem là mẫu đại diện hay kết luận
-workflow tốt hơn trên toàn dataset. Khi `score` mặc định trên đủ 40 case,
-partial hai run lần lượt là 6,25% và 8,33% do case thiếu nhận 0.
+`agent-tools` là đáp án của agent Claude gọi CLI `tool` (bốn subagent, mỗi
+case một lần); các công cụ và lời dặn được viết sau khi đã xem một số case
+dev, nên con số này lạc quan. Oracle cũng không phải đối thủ RCA thực tế.
 
 Mốc may rủi qua seed 0–1999: random trung bình giải đúng 1,9/40, partial 11,1%;
 11,65% lần thử đạt ít nhất 4/40. Chênh lệch vài case cần được diễn giải cùng
 coverage, loại task và cách chọn tập đánh giá.
 
-Cả 10 report workflow đã lưu đều hết `problems` ở lần cuối, nhưng chỉ 3 case
-solved: kiểm tra bằng chứng chưa đảm bảo đáp án đúng. Repo hiện không kèm
+Qua bước kiểm tra bằng chứng không đảm bảo đáp án đúng: kiểm tra chỉ xét
+bằng chứng có khớp loại lỗi và thời điểm hay không. Repo hiện không kèm
 scorer/archive chính thức để kiểm chứng lại tuyên bố tương đương bộ chấm
 OpenRCA trên toàn bộ 136 câu hỏi.
 
@@ -265,13 +281,13 @@ OpenRCA trên toàn bộ 136 câu hỏi.
 |---|---|
 | Dependencies chính chỉ khai báo DuckDB, nhưng CLI import `tools → microrank → numpy` ngay khi khởi động. | Cài mặc định sạch thiếu NumPy có thể lỗi cả `--help`. Group `baro` đang cung cấp NumPy gián tiếp. |
 | `Case` truyền vào phần suy luận chứa `faults`; số đáp án lấy từ `len(case.faults)`. | Prompt không nhận các giá trị ground truth, nhưng inference vẫn phụ thuộc nhãn và chưa có ranh giới chống dùng nhãn nhầm. |
-| Workflow hết retry vẫn ghi đáp án; chưa kiểm tra trùng nguyên nhân; tolerance onset bằng chứng là 300 giây. | Đáp án có thể thiếu bằng chứng hoặc trùng lặp, trong khi scorer chỉ cho lệch 60 giây so với nhãn. |
+| Workflow hết retry vẫn ghi đáp án; tolerance onset bằng chứng là 300 giây; kiểm tra cấm hai lỗi trùng component trong khi `bank-028`, `bank-029` có hai lỗi cùng component. | Đáp án có thể thiếu bằng chứng, trong khi scorer chỉ cho lệch 60 giây so với nhãn; hai case trên không thể đúng hết. |
 | Schema giờ cho phép `24:00`–`29:59`; chưa kiểm tra response đầy đủ; CLI agent/workflow chỉ bắt `OSError`. | JSON lỗi, trường thiếu hoặc giờ không hợp lệ có thể làm dừng cả lệnh, thay vì ghi lỗi riêng cho case. |
-| Candidates BARO đứng trước rồi cắt còn 8; evidence chủ yếu dựa vào metric tăng. | Khi BARO đã đủ 8 candidates, graph không thêm component vào danh sách evidence. Tín hiệu giảm, missing data, phân biệt latency/packet loss còn dựa nhiều vào heuristic. |
+| Evidence chủ yếu dựa vào metric và exclusive time tăng. | Tín hiệu giảm, missing data, phân biệt latency/packet loss còn dựa nhiều vào heuristic. |
 | BARO fallback về đầu cửa sổ nhưng phần mô tả vẫn gọi đó là BOCPD change point. | Report chưa phân biệt điểm thay đổi phát hiện được với mốc mặc định. |
 | Topology, KPI regex, component/reason và ngày bình thường gắn cứng với Bank. | `--system` đổi đường dẫn, chưa biến hệ thống thành RCA đa dataset. |
 | Thiếu manifest run; ghi predictions chưa atomic; chạy lại cùng tên tái sử dụng kết quả cũ. | Khó tái lập/so sánh sạch; lỗi khi chạy lại có thể để lại đáp án cũ. Chưa phù hợp nhiều worker ghi cùng run. |
-| Tests tập trung ở parser, scorer, telemetry và KPI mapping. | Chưa có test riêng cho vòng lặp LLM, workflow verify/retry, BARO, MicroRank, TraceRCA và quản lý artifacts. |
+| Tests tập trung ở parser, scorer, telemetry, KPI mapping và MicroRank. | Chưa có test riêng cho workflow verify/retry, BARO và quản lý artifacts. |
 
 BARO dùng pandas và điền dữ liệu nhìn cả cửa sổ; MicroRank dùng ma trận NumPy
 dense theo operations/traces. Đây là thiết kế offline, chưa có benchmark tài
@@ -295,9 +311,9 @@ nguyên để khẳng định khả năng xử lý stream hay tải production. 
 
 ## 6. Cách chạy với code hiện tại
 
-Cần Python ≥ 3.13, `uv`, dữ liệu `Bank.zip`. Lệnh LLM cần Ollama đang chạy
-và có sẵn model tương ứng; URL mặc định `http://localhost:11434`, đổi qua
-`--url`. Các ví dụ dùng group `baro` để có đủ dependency cho toàn bộ CLI hiện
+Cần Python ≥ 3.13, `uv`, dữ liệu `Bank.zip`. Lệnh `workflow` cần Ollama đang
+chạy và có sẵn model tương ứng; URL mặc định `http://localhost:11434`, đổi
+qua `--url`. Các ví dụ dùng group `baro` để có đủ dependency cho toàn bộ CLI hiện
 tại, bao gồm NumPy đang được import gián tiếp.
 
 ```bash
@@ -325,21 +341,27 @@ uv run --group baro python -m rca baseline openrca-agent \
 uv run --group baro python -m rca score runs/*/predictions.jsonl
 ```
 
-Điều tra một case và thử hai nhánh LLM:
+Điều tra một case, chạy workflow, hoặc để một agent ngoài làm bước chọn:
 
 ```bash
 uv run --group baro python -m rca tool question bank-018
 uv run --group baro python -m rca tool overview bank-018
-uv run --group baro python -m rca tool anomalies bank-018 --top 10
+uv run --group baro python -m rca tool baro bank-018 --top 10
+uv run --group baro python -m rca tool exclusive bank-018
+uv run --group baro python -m rca tool calls bank-018
 uv run --group baro python -m rca tool series bank-018 Tomcat01 CPU
 uv run --group baro python -m rca tool traces bank-018
+uv run --group baro python -m rca tool hypothesis bank-018 --run demo add --component Tomcat01 \
+  --reason "network latency" --if-true "..." --if-false "..."
+uv run --group baro python -m rca tool question normal-2021_03_06-0930
 
-uv run --group baro python -m rca agent \
-  --model qwen3:4b-instruct-2507-q4_K_M --cases bank-018 --run demo-agent
 uv run --group baro python -m rca workflow \
   --model qwen3:4b-instruct-2507-q4_K_M --cases bank-018 --run demo-workflow
+uv run --group baro python -m rca flow prompt bank-018
+uv run --group baro python -m rca flow submit bank-018 --run demo-flow \
+  --answers '{"answers": [{"component": "Tomcat01", "reason": "network latency", "onset_minute": "11:20", "why": "..."}], "confidence": "medium"}'
 uv run --group baro python -m rca score \
-  runs/demo-agent/predictions.jsonl runs/demo-workflow/predictions.jsonl \
+  runs/demo-workflow/predictions.jsonl runs/demo-flow/predictions.jsonl \
   --cases bank-018 --detail
 ```
 
@@ -347,8 +369,6 @@ Dùng tên `--run` mới cho mỗi thí nghiệm cần tách biệt. Tùy chọn
 `--system`, `--runs` đứng **trước** subcommand, ví dụ
 `python -m rca --data /path/to/data cases 2021_03_09`.
 
-Trong lần rà soát này, **28 tests hiện có đều pass** bằng
-`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider`.
-Đã đọc code và chấm lại artifacts có sẵn; chưa chạy lại ingestion toàn bộ dữ
-liệu hoặc gọi LLM để tạo benchmark mới. Thay đổi của lần rà soát chỉ ở README.
+Sau lần dọn ngày 04/11/2026 và khi thêm tool 2, **38 tests đều pass** bằng
+`uv run --group baro pytest -q`.
 # rca-agent

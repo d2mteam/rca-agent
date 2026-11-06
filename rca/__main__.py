@@ -1,14 +1,14 @@
-"""Command line: prepare data, list cases, write baseline answers, score answers."""
+"""Command line: prepare data, list cases, write baseline answers, investigate, run the workflow, score."""
 
 import argparse
 import json
-import subprocess
+import re
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from rca import bank, baselines, report, statistical, tools
-from rca.cases import CST, load_cases
+from rca import bank, baselines, hypotheses, report, statistical, tools
+from rca.cases import CST, Case, load_cases
 from rca.scoring import load_predictions, score_case, write_predictions
 from rca.telemetry import connect, prepare_day, window_counts
 
@@ -57,16 +57,11 @@ def cmd_baseline(args: argparse.Namespace) -> None:
         if args.archive is None:
             raise SystemExit("openrca-agent needs --archive path/to/OpenRCA/rca/archive/agent-Bank.csv")
         predictions = baselines.openrca_agent(cases, args.archive)
-    elif args.name in ("baro", "msbaro"):
+    elif args.name == "baro":
         from rca import baro  # optional dependency group "baro"
 
         con = connect(args.data / "parquet" / args.system)
-        predictions = {c.case_id: baro.answer(con, c, multi_source=args.name == "msbaro") for c in cases}
-    elif args.name == "torai":
-        from rca import torai  # optional dependency group "baro" (scikit-learn, scipy)
-
-        con = connect(args.data / "parquet" / args.system)
-        predictions = {c.case_id: torai.answer(con, c) for c in cases}
+        predictions = {c.case_id: baro.answer(con, c) for c in cases}
     else:
         run_name = f"{args.name}-{args.reference}"
         con = connect(args.data / "parquet" / args.system)
@@ -106,58 +101,23 @@ def cmd_score(args: argparse.Namespace) -> None:
             print(report.case_lines(scores))
 
 
-def cmd_agent(args: argparse.Namespace) -> None:
-    from rca import ollama_agent
-
-    con = connect(args.data / "parquet" / args.system)
-    run_dir = args.runs / (args.run or f"ollama-{args.model.replace(':', '_').replace('/', '_')}")
-    cases = [c for c in _cases(args) if not args.cases or c.case_id in args.cases]
-    for c in cases:
-        started = datetime.now()
-        try:
-            calls = ollama_agent.solve(con, c, run_dir, args.model, args.url, args.max_steps, args.num_ctx)
-        except OSError as error:  # a timed-out or refused model call loses this case only
-            print(f"{c.case_id}: failed ({error})", flush=True)
-            continue
-        print(f"{c.case_id}: {calls} tool calls, {(datetime.now() - started).seconds}s", flush=True)
-    print(f"answers -> {run_dir / 'predictions.jsonl'}")
-
-
 def cmd_workflow(args: argparse.Namespace) -> None:
     from rca import workflow  # needs the optional group "baro"
 
     con = connect(args.data / "parquet" / args.system)
-    prefix = "workflow-msbaro" if args.multi_source else "workflow"
-    run_dir = args.runs / (args.run or f"{prefix}-{args.model.replace(':', '_').replace('/', '_')}")
+    run_dir = args.runs / (args.run or f"workflow-{args.model.replace(':', '_').replace('/', '_')}")
     (run_dir / "reports").mkdir(parents=True, exist_ok=True)
     predictions = load_predictions(run_dir / "predictions.jsonl") if (run_dir / "predictions.jsonl").exists() else {}
     for c in [c for c in _cases(args) if not args.cases or c.case_id in args.cases]:
         started = datetime.now()
         try:
-            predictions[c.case_id], report_ = workflow.run(con, c, args.model, args.url, multi_source=args.multi_source)
+            predictions[c.case_id], report_ = workflow.run(con, c, args.model, args.url)
         except OSError as error:  # a timed-out or refused model call loses this case only
             print(f"{c.case_id}: failed ({error})", flush=True)
             continue
         (run_dir / "reports" / f"{c.case_id}.json").write_text(json.dumps(asdict(report_), indent=1, ensure_ascii=False))
         write_predictions(run_dir / "predictions.jsonl", predictions)
         print(f"{c.case_id}: {len(report_.attempts)} attempt(s), {(datetime.now() - started).seconds}s", flush=True)
-    print(f"answers -> {run_dir / 'predictions.jsonl'}")
-
-
-def cmd_codex(args: argparse.Namespace) -> None:
-    from rca import codex_agent
-
-    name = args.run or "codex-" + ("oss-" if args.oss else "") + (args.model or "default").replace(":", "_").replace("/", "_")
-    run_dir = args.runs / name
-    for c in [c for c in _cases(args) if not args.cases or c.case_id in args.cases]:
-        started = datetime.now()
-        try:
-            calls, violations, code = codex_agent.solve(c.case_id, Path.cwd(), run_dir, args.model, args.oss, args.effort)
-        except subprocess.TimeoutExpired:
-            print(f"{c.case_id}: timed out", flush=True)
-            continue
-        flag = f"  RULE BREAKS: {violations}" if violations else ""
-        print(f"{c.case_id}: exit {code}, {calls} commands, {(datetime.now() - started).seconds}s{flag}", flush=True)
     print(f"answers -> {run_dir / 'predictions.jsonl'}")
 
 
@@ -169,7 +129,7 @@ def cmd_flow(args: argparse.Namespace) -> None:
     if case is None:
         raise SystemExit(f"no case {args.case_id}")
     con = connect(args.data / "parquet" / args.system)
-    prompt, evidence_of, drops, report_ = workflow.build(con, case, args.multi_source)
+    prompt, evidence_of, drops, report_ = workflow.build(con, case)
     if args.step == "prompt":
         print(prompt)
         print(f'\nAnswer with: python -m rca flow submit {case.case_id} --answers \'<JSON>\'  where JSON is '
@@ -198,20 +158,50 @@ def cmd_flow(args: argparse.Namespace) -> None:
     print(f"{case.case_id}: recorded" + (" (unverified)" if problems else ""))
 
 
+def _normal_window(case_id: str, cases) -> Case | None:
+    """normal-YYYY_MM_DD-HHMM: 30 minutes with no query, at least an hour away from every query window."""
+    match = re.fullmatch(r"normal-(\d{4}_\d{2}_\d{2})-([01]\d|2[0-3])([0-5]\d)", case_id)
+    if not match:
+        return None
+    day, hour, minute = match.groups()
+    start = int(datetime.strptime(day, "%Y_%m_%d").replace(hour=int(hour), minute=int(minute), tzinfo=CST).timestamp())
+    end = start + 1800
+    if any(start < c.end + 3600 and end > c.start - 3600 for c in cases):
+        raise SystemExit(f"{case_id} lies within an hour of a query window; pick a normal window farther away")
+    return Case(case_id, "", "", frozenset(), start, end, ())
+
+
 def cmd_tool(args: argparse.Namespace) -> None:
-    case = next((c for c in load_cases(args.data / "openrca" / args.system) if c.case_id == args.case_id), None)
+    cases = load_cases(args.data / "openrca" / args.system)
+    case = _normal_window(args.case_id, cases) or next((c for c in cases if c.case_id == args.case_id), None)
     if case is None:
         raise SystemExit(f"no case {args.case_id}")
+    if args.tool == "submit" and not case.faults:
+        raise SystemExit(f"{args.case_id} is a normal window; there is nothing to submit")
     if args.tool == "submit":
-        tools.submit(case, args.runs / args.run / "answers", args.time, args.component, args.reason, args.append)
+        tools.submit(case, args.runs / args.run / "answers", args.time, args.component, args.reason, args.append,
+                     args.protocol)
+        return
+    if args.tool == "hypothesis":
+        run_dir = args.runs / args.run
+        if args.action == "add":
+            entry = hypotheses.add(run_dir, case.case_id, args.component, args.reason, args.if_true, args.if_false)
+            print(f"hypothesis #{entry['id']} added")
+        elif args.action == "test":
+            hypotheses.test(run_dir, case.case_id, args.id, args.status, args.evidence)
+        print(hypotheses.describe(hypotheses.load(run_dir, case.case_id)))
         return
     con = connect(args.data / "parquet" / args.system)
     if args.tool == "question":
-        tools.question(con, case)
+        tools.question(con, case, args.protocol)
     elif args.tool == "overview":
         tools.overview(con, case)
-    elif args.tool == "anomalies":
-        tools.anomalies(con, case, args.component, args.top)
+    elif args.tool == "calls":
+        tools.calls(con, case)
+    elif args.tool == "baro":
+        tools.baro_ranking(con, case, args.component, args.top)
+    elif args.tool == "exclusive":
+        tools.exclusive(con, case)
     elif args.tool == "series":
         tools.series(con, case, args.component, args.kpi)
     elif args.tool == "traces":
@@ -237,7 +227,7 @@ def main() -> None:
     cases.set_defaults(func=cmd_cases)
 
     baseline = sub.add_parser("baseline", help="write answers of a reference baseline to runs/<name>/")
-    baseline.add_argument("name", choices=["oracle", "random", "openrca-agent", "zscore", "iqr", "baro", "msbaro", "torai"])
+    baseline.add_argument("name", choices=["oracle", "random", "openrca-agent", "zscore", "iqr", "baro"])
     baseline.add_argument("--reference", choices=["before", "normal-day"], default="before",
                           help="zscore/iqr: reference period for the normal level")
     baseline.add_argument("--days", nargs="*", default=EVAL_DAYS)
@@ -252,65 +242,61 @@ def main() -> None:
     score.add_argument("--detail", action="store_true", help="add per-reason and per-case breakdowns")
     score.set_defaults(func=cmd_score)
 
-    agent = sub.add_parser("agent", help="run the tool-calling agent on a local Ollama model")
-    agent.add_argument("--model", default="qwen3:4b-instruct-2507-q4_K_M")
-    agent.add_argument("--url", default="http://localhost:11434")
-    agent.add_argument("--cases", nargs="*", help="only these case ids")
-    agent.add_argument("--days", nargs="*", default=EVAL_DAYS)
-    agent.add_argument("--run", help="run name; default ollama-<model>")
-    agent.add_argument("--max-steps", type=int, default=14)
-    agent.add_argument("--num-ctx", type=int, default=16384)
-    agent.set_defaults(func=cmd_agent)
-
     flow = sub.add_parser("workflow", help="code-led workflow: BARO + graph tools, a local Ollama model decides")
     flow.add_argument("--model", default="qwen3:4b-instruct-2507-q4_K_M")
     flow.add_argument("--url", default="http://localhost:11434")
     flow.add_argument("--cases", nargs="*", help="only these case ids")
     flow.add_argument("--days", nargs="*", default=EVAL_DAYS)
-    flow.add_argument("--run", help="run name; default workflow[-msbaro]-<model>")
-    flow.add_argument("--multi-source", action="store_true", help="tool 1 is multi-source BARO (metrics + log lines + trace spans)")
+    flow.add_argument("--run", help="run name; default workflow-<model>")
     flow.set_defaults(func=cmd_workflow)
-
-    codex = sub.add_parser("codex", help="run the free tool-using agent through the Codex CLI, one case at a time")
-    codex.add_argument("--model", help="Codex model, e.g. gpt-6-luna; with --oss an Ollama model")
-    codex.add_argument("--oss", action="store_true", help="use a local Ollama model through Codex")
-    codex.add_argument("--effort", help="model_reasoning_effort, e.g. low, medium, high")
-    codex.add_argument("--cases", nargs="*", help="only these case ids")
-    codex.add_argument("--days", nargs="*", default=EVAL_DAYS)
-    codex.add_argument("--run", help="run name; default codex-<model>")
-    codex.set_defaults(func=cmd_codex)
 
     flow = sub.add_parser("flow", help="workflow steps for an agent acting as the deciding LLM")
     flow.set_defaults(func=cmd_flow)
     steps = flow.add_subparsers(dest="step", required=True)
     p = steps.add_parser("prompt")
     p.add_argument("case_id")
-    p.add_argument("--multi-source", action="store_true")
     p = steps.add_parser("submit")
     p.add_argument("case_id")
     p.add_argument("--answers", required=True, help="the JSON answer")
     p.add_argument("--final", action="store_true", help="record even if verification fails")
-    p.add_argument("--multi-source", action="store_true")
     p.add_argument("--run", default="workflow-sonnet")
 
     tool = sub.add_parser("tool", help="investigation tools for an agent working on one case")
     tool.set_defaults(func=cmd_tool)
+    tool.add_argument("--protocol", choices=["hypotheses", "free"], default="hypotheses",
+                      help="hypotheses: answers must follow a tested hypothesis; free: no protocol")
     kinds = tool.add_subparsers(dest="tool", required=True)
-    for name in ("question", "overview", "traces"):
+    for name in ("question", "overview", "calls", "exclusive", "traces"):
         kinds.add_parser(name).add_argument("case_id")
-    p = kinds.add_parser("anomalies")
+    p = kinds.add_parser("baro")
     p.add_argument("case_id")
     p.add_argument("--component", choices=bank.COMPONENTS)
-    p.add_argument("--top", type=int, default=15)
+    p.add_argument("--top", type=int, default=20)
     p = kinds.add_parser("series")
     p.add_argument("case_id")
     p.add_argument("component", choices=bank.COMPONENTS)
-    p.add_argument("kpi", help="substring of the KPI name, e.g. CPU or HeapMemory")
+    p.add_argument("kpi", help="substring of the KPI name; \"\" lists every KPI")
     p = kinds.add_parser("logs")
     p.add_argument("case_id")
     p.add_argument("component", choices=bank.COMPONENTS)
     p.add_argument("--grep", help="only lines containing this text")
     p.add_argument("--samples", type=int, default=10)
+    p = kinds.add_parser("hypothesis")
+    p.add_argument("case_id")
+    p.add_argument("--run", default="agent-tools")
+    actions = p.add_subparsers(dest="action", required=True)
+    run = argparse.ArgumentParser(add_help=False)
+    run.add_argument("--run", default=argparse.SUPPRESS, help="run name, as given to submit")
+    a = actions.add_parser("add", parents=[run])
+    a.add_argument("--component", required=True)
+    a.add_argument("--reason", required=True)
+    a.add_argument("--if-true", required=True, help="what you expect to observe if this is the cause")
+    a.add_argument("--if-false", required=True, help="what you expect to observe if it is not")
+    a = actions.add_parser("test", parents=[run])
+    a.add_argument("id", type=int)
+    a.add_argument("--status", required=True, choices=hypotheses.STATUSES)
+    a.add_argument("--evidence", required=True, help="which tool output and numbers")
+    actions.add_parser("list", parents=[run])
     p = kinds.add_parser("submit")
     p.add_argument("case_id")
     p.add_argument("--time", required=True, help="YYYY-MM-DD HH:MM:SS")

@@ -16,7 +16,8 @@ Dữ liệu minh họa: OpenRCA – hệ thống ngân hàng (Bank)
 
 ## Bài toán
 
-- Mỗi sự cố: một **cửa sổ 30 phút** có 1–2 lỗi
+- Mỗi câu hỏi cho một **cửa sổ 30 phút**; trong đó có **1 lỗi** (87% câu) hoặc **2 lỗi** (13% câu)
+- Cửa sổ là phạm vi tìm kiếm. **Bản thân sự cố ngắn hơn nhiều** (thường vài phút) và có thể bắt đầu ở bất kỳ phút nào trong cửa sổ
 - Cần trả lời: **thời điểm** (sai số ≤ 60 giây), **máy** (1 trong 14), **lý do** (1 trong 8)
 
 | 14 máy | 8 lý do |
@@ -110,6 +111,7 @@ $$a_t = \frac{|x_t - \text{median}|}{\text{IQR}} \qquad \rho = \max_{t \ge \hat 
 - median và IQR (khoảng giữa phân vị 25% và 75%) lấy từ **giai đoạn trước** $\hat t_A$
 - Dùng median/IQR thay mean/std vì **ít bị điểm lạ kéo lệch**, chịu được việc chọn $\hat t_A$ chưa chính xác
 - Xếp các chuỗi theo $\rho$ giảm dần: đầu bảng là nghi phạm
+- Package của tác giả (pipeline đang dùng) bỏ dấu trị tuyệt đối, chỉ tính chiều **tăng**: $a_t = (x_t - \text{median}) / \text{IQR}$
 
 ---
 
@@ -128,56 +130,87 @@ MG02:    TCP FIN-WAIT           0.00 -> 6.00    (robust score 6,   from 13:11)
 
 ---
 
-## Multi-source BARO: thêm log và trace
+## MicroRank (1/4): ý tưởng và trace bất thường
 
-Ý tưởng (RCAEval): biến log và trace thành **chuỗi thời gian**, thêm cột vào cùng bảng
+Ý tưởng (phân tích phổ): thao tác nằm trên **nhiều trace bất thường** và **ít trace bình thường** là nghi phạm. PageRank cân trọng số cho từng trace trước khi đếm.
 
-| Cột thêm | Cách tính (mỗi phút) |
-|---|---|
-| `<máy>\|log_<tên log>_lines` | Số dòng log |
-| `<máy>\|trace_spans` | Số span |
-| `<máy>\|trace_latency_ms` | Độ trễ span trung bình |
+**Thao tác** $o$ = máy + phía (`Tomcat04:call` hoặc `Tomcat04:serve`), vì trace Bank không có tên API
 
-- Thêm ~25 cột; công thức chấm **giữ nguyên**
-- Điểm cắt vẫn lấy từ BOCPD trên bảng gốc
+**Trace bất thường** (Eq. 1):
 
----
+$$L_{expected} = \sum_{o} count_o \cdot \big(\mu_o + n\,\sigma_o\big), \qquad n = 1.5$$
 
-## MicroRank (1/2): ý tưởng
+- $count_o$: số span của thao tác $o$ trong trace · $\mu_o, \sigma_o$: trung bình, độ lệch chuẩn của $o$ ở giờ trước
+- Trace bất thường nếu độ trễ thực > $L_{expected}$
 
-**Thao tác** = máy + phía (`Tomcat04:call` hoặc `Tomcat04:serve`), vì trace Bank không có tên API
-
-1. **Mức bình thường** của mỗi thao tác = mean + std ở giờ trước
-2. Một trace là **bất thường** nếu
-
-$$d_{trace} > \sum_{op \in trace} \big(\mu_{op} + \sigma_{op}\big) + 50\ \text{ms}$$
-
-3. **PageRank cá nhân hóa** ($d=0.85$, 25 vòng) trên đồ thị thao tác–trace, chạy riêng cho nhóm bất thường và nhóm bình thường
-4. Điểm phổ **DStar2** cho mỗi thao tác:
-
-$$\text{score}(op) = \frac{e_f^2}{e_p + n_f}$$
-
-$e_f$: trọng số trace bất thường đi qua $op$ · $e_p$: trace bình thường đi qua · $n_f$: trace bất thường không đi qua
+**Loại trace (kind):** các trace có cùng **cây phủ** (thao tác + quan hệ cha–con) là cùng loại
 
 ---
 
-## MicroRank (2/2): dữ liệu vào và đầu ra
+## MicroRank (2/4): đồ thị và ma trận chuyển
 
-**Vào** (ví dụ một cửa sổ): 802.228 span → **40.827 trace**
+Đồ thị có 2 loại nút: **thao tác** và **trace**. Cạnh: thao tác → thao tác (lời gọi), trace ↔ thao tác (trace phủ thao tác)
 
-```
-gw01...1645 | 2777 ms | [dockerA1:serve, MG02:call, MG02:serve, Tomcat04:serve, IG01:call, ...]
-```
+$$A = \begin{bmatrix} \omega A_{oo} & A_{ot} \\ A_{to} & 0 \end{bmatrix} \quad \text{(Eq. 5–6)}, \qquad \omega = 0.01$$
 
-- Thêm tập cạnh gọi cha → con để dựng đồ thị; điểm của máy = điểm cao nhất trong các thao tác của nó
+Mỗi bước đi chia đều cho các nút kề (Eq. 2):
 
-**Ra:** `IG02: 1.00, Tomcat01: 0.98, IG01: 0.76, MG02: 0.21 ...`
+- $A_{oo}[j, i] = 1 / |\text{callee}(i)|$ nếu thao tác $i$ gọi $j$
+- $A_{ot}[o, t] = 1 / |O(t)|$ nếu trace $t$ phủ thao tác $o$
+- $A_{to}[t, o] = 1 / |T(o)|$ nếu thao tác $o$ nằm trong trace $t$
 
-**Bổ sung của nhóm** (cho máy không có trace): so phần traffic giữa các replica
+$O(t)$: các thao tác trace $t$ phủ · $T(o)$: các trace phủ thao tác $o$ · $\omega$ nhỏ: lời gọi chỉ dùng để phân biệt các thao tác cùng nằm trên một nhóm trace
+
+---
+
+## MicroRank (3/4): PageRank cá nhân hóa
+
+Vector ưu tiên chỉ đặt trên trace, $u = [\,\mathbf{0};\ \theta\,]$ (Eq. 7):
+
+$$\theta_i = \varphi \cdot \frac{n_i^{-1}}{\sum_j n_j^{-1}} + (1-\varphi) \cdot \frac{k_i^{-1}}{\sum_j k_j^{-1}}, \qquad \varphi = 0.5$$
+
+- $n_i$: số thao tác trace $i$ phủ · $k_i$: số trace cùng loại với $i$ · nhóm bình thường chỉ dùng phần $k$
+- Ý nghĩa: trace **phủ ít thao tác** khoanh vùng hẹp hơn, nên quan trọng hơn; **loại trace hiếm** không bị loại phổ biến lấn át
+
+Lặp (Eq. 4), chạy riêng cho nhóm bất thường và nhóm bình thường:
+
+$$v^{(q)} = d \cdot A\, v^{(q-1)} + (1-d) \cdot u, \qquad d = 0.85$$
+
+Kết quả: điểm $F(o)$ (bất thường) và $P(o)$ (bình thường), chuẩn hóa để lớn nhất bằng 1
+
+<small>Bài báo không ghi $d$, $\omega$ và số vòng lặp; lấy theo code tác giả: 25 vòng, mỗi vòng chuẩn hóa $v$ về lớn nhất bằng 1. Cài đặt tái tạo đúng ví dụ số trong bài: $u = [8/21,\ 13/42,\ 13/42]$, $F = [0.990,\ 0.328,\ 0.328,\ 1]$.</small>
+
+---
+
+## MicroRank (4/4): phổ có trọng số, vào và ra
+
+Phổ có trọng số (Eq. 8):
+
+$$O_{ef} = F \cdot N_{ef}, \qquad O_{nf} = F \cdot (N_f - N_{ef}), \qquad O_{ep} = P \cdot N_{ep}$$
+
+$N_{ef}, N_{ep}$: số trace bất thường / bình thường phủ thao tác · $N_f$: tổng số trace bất thường · thao tác không có điểm thì $F$ hoặc $P = 0.0001$
+
+Điểm **Ochiai** (công thức mặc định của bài báo):
+
+$$\text{score}(o) = \frac{O_{ef}}{\sqrt{(O_{ef} + O_{ep})(O_{ef} + O_{nf})}}$$
+
+Điểm của máy = điểm cao nhất trong các thao tác của nó
+
+**Vào** (ví dụ một cửa sổ): 802.228 span → **40.827 trace**, ví dụ `gw01...1645 | 2777 ms | [dockerA1:serve, MG02:call, MG02:serve, Tomcat04:serve, IG01:call, ...]`
+
+**Ra:** `IG01: 1.00, IG02: 0.86, Tomcat01: 0.84, Tomcat03: 0.72, Tomcat04: 0.60`
+
+---
+
+## Tool Graph: so traffic giữa các replica (bổ sung của nhóm)
+
+MicroRank không thấy máy không có trace (apache, Mysql, Redis). Nhóm thêm phép so **phần traffic** của mỗi máy trong tầng của nó:
 
 $$share_i(t) = \frac{n_i(t)}{\sum_j n_j(t)}$$
 
-Cảnh báo nếu $share_i(t) < 0.5 \cdot share_i^{\text{bình thường}}$ trong ≥ 2 phút. Với apache, $n$ = số dòng access log mỗi phút.
+- $n_i(t)$: số span của máy $i$ trong phút $t$; với apache là số dòng access log
+- Cảnh báo nếu $share_i(t) < 0.5 \cdot share_i^{\text{bình thường}}$ trong ≥ 2 phút liên tiếp
+- Ra: *"MG02 chỉ còn 0% phần traffic của MG01/MG02 từ 13:10 đến 13:15; MG01 nhận thay"*
 
 ---
 
@@ -204,7 +237,7 @@ Ví dụ quy tắc:
 | Tool | Thấy gì |
 |---|---|
 | BARO | Đứng đầu là **nhiễu**: đĩa Mysql02 (824 điểm), một core của apache01 (412 điểm). MG02 chỉ có FIN-WAIT 0→6 |
-| Graph | MicroRank xếp IG02 đầu. **Nhưng:** *MG02 chỉ còn 0% phần traffic từ 13:10, MG01 nhận thay* |
+| Graph | MicroRank xếp IG01 đầu, MG02 không vào top 5. **Nhưng:** *MG02 chỉ còn 0% phần traffic từ 13:10, MG01 nhận thay* |
 
 **LLM:** bỏ qua hạng đầu của BARO và MicroRank, theo câu tóm tắt của tool graph cùng quy tắc → **MG02, network packet loss, 13:10** ✔
 
@@ -217,13 +250,15 @@ Ví dụ quy tắc:
 
 **Đề:** chỉ hỏi **thời điểm** · phản hồi lên tới 9 giây
 
-- MicroRank xếp **MG02 hạng 1** (độ trễ lan từ Tomcat02 sang)
-- LLM lần 1 chọn **MG02**, lấy nhầm số liệu của MG01 làm bằng chứng
-- **Code kiểm chứng bắt được:** MG02 không có bằng chứng cho lý do đó
-- LLM lần 2: **Tomcat02, 16:24** ✔ (đáp án 16:23, trong ±60 giây)
+| Tool | Thấy gì |
+|---|---|
+| BARO | Tomcat02: RAM (không tính cache) 42.8 → 51.3 %, CPU 27.7 → 79.9 %, cùng từ 16:24 |
+| Graph | MicroRank xếp **dockerA1, dockerA2, MG02** đầu: 277 trace bị coi là bất thường lệch về các trace có gọi docker, không tập trung vào Tomcat02. Tomcat03 mất phần traffic từ 16:27 |
 
-**Ưu:** vòng kiểm chứng sửa được lỗi gán nhầm bằng chứng
-**Nhược:** lý do chọn là *CPU* hoặc *memory*, còn nguyên nhân thật là **OOM**, vì pipeline chưa thấy log GC (1 → 56 dòng/phút). Ca này đúng vì đề chỉ hỏi thời điểm.
+**LLM:** chọn thay đổi sớm và mạnh nhất trong bằng chứng BARO, không theo hạng đầu MicroRank và không theo Tomcat03 → **Tomcat02, 16:24** ✔ (đáp án 16:23, trong ±60 giây)
+
+**Ưu:** LLM gạt được hai tín hiệu sai của tool graph
+**Nhược:** lý do chọn là *high memory usage*, còn nguyên nhân thật là **OOM**, vì pipeline chưa thấy log GC (1 → 56 dòng/phút). Ca này đúng vì đề chỉ hỏi thời điểm.
 
 ---
 
@@ -234,7 +269,7 @@ Ví dụ quy tắc:
 | Tool | Thấy gì |
 |---|---|
 | BARO | **FIN-WAIT 0→59 bị loại** (cột hằng số trước đó). Đầu bảng là nhiễu: Mysql02, core nhảy, **đĩa MG02 0→152 chỉ 1 phút** |
-| Graph | ✔ *apache01 chỉ còn 5% phần traffic từ 20:25; apache02 nhận thay* |
+| Graph | MicroRank không có kết quả. ✔ *apache01 chỉ còn 5% phần traffic từ 20:25; apache02 nhận thay* |
 
 **LLM:** chọn **MG02, disk I/O, 20:13** ✘, bị con số 152 của nhiễu thu hút. Bước kiểm chứng vẫn cho qua vì chưa kiểm tra độ dài của bằng chứng.
 
@@ -244,13 +279,18 @@ Ví dụ quy tắc:
 
 ## Ca LLM chưa xử lý tốt 2: Tomcat01 network latency (11:20)
 
-**Đề:** hỏi máy và lý do · tỉ lệ thành công còn ~75% (1 trong 4 Tomcat không phản hồi)
+**Đề:** hỏi máy và lý do · tỉ lệ thành công còn ~72% từ 11:20 đến 11:24 (1 trong 4 Tomcat không phản hồi)
 
-- Access log Tomcat01 về 0, 60 kết nối FIN-WAIT, packet giảm từ ~1.050 xuống ~100
-- **MicroRank xếp IG02, IG01 đầu** (Tomcat01 gần như 0): thiên về máy nằm trên nhiều đường đi, dễ kéo LLM sang nhầm máy
-- Khi LLM tìm đúng Tomcat01, nó chọn *packet loss* trong khi đáp án là **latency** ✘
+| Tool | Thấy gì |
+|---|---|
+| BARO | Đầu bảng toàn nhiễu đĩa và core (IG01, apache01, Mysql01...). 8 chỗ ứng viên bị chiếm hết, **Tomcat01 không có bằng chứng metric** |
+| Graph | MicroRank **không có kết quả**: Eq. 1 không đánh dấu trace nào bất thường (giờ trước chậm hơn cả cửa sổ). ✔ *Tomcat01 chỉ còn 0% phần traffic 11:20–11:24* |
 
-**Nhược:** khi độ trễ rất lớn, latency và loss cho **cùng một biểu hiện** (traffic sập, FIN-WAIT). Cần thời gian từng cạnh gọi (timeout 15,4 giây từ IG tới Tomcat01) nhưng pipeline chưa dùng.
+**LLM:** theo câu của tool graph → **Tomcat01** ✔, nhưng chọn *network packet loss* trong khi đáp án là **latency** ✘
+
+**Nhược:**
+- Khi độ trễ rất lớn, latency và loss cho **cùng một biểu hiện** (traffic sập, FIN-WAIT); cần thời gian từng cạnh gọi (timeout 15,4 giây từ IG tới Tomcat01) nhưng pipeline chưa dùng
+- MicroRank phụ thuộc giờ trước có bình thường không; ứng viên ưu tiên BARO nên máy lỗi bị đẩy khỏi phần bằng chứng
 
 ---
 
@@ -258,9 +298,9 @@ Ví dụ quy tắc:
 
 | Ưu | Nhược |
 |---|---|
-| Code cố định → **tái lập, kiểm chứng được**, nhanh | Bằng chứng gom sẵn, **không đi lấy thêm** theo giả thuyết |
+| Code cố định → **tái lập, kiểm chứng được**, nhanh | Bằng chứng gom sẵn, **không đi lấy thêm** theo giả thuyết; 8 chỗ ứng viên ưu tiên BARO |
 | LLM chỉ đọc bản tóm tắt, có quy tắc backend → **lọc nhiễu, giải thích được** | BARO: metric hệ điều hành rất nhiễu, mất cột "phẳng rồi bật lên" |
-| Hai tool bù nhau (tài nguyên và mạng) | MicroRank: mù với apache/Mysql/Redis, thiên về IG/MG |
+| Hai tool bù nhau (tài nguyên và mạng) | MicroRank: mù với apache/Mysql/Redis, nghiêng về máy nằm trên nhiều đường đi; Eq. 1 có lúc không bắt được trace nào |
 | Tool so traffic xử lý được máy không có trace | Chưa phân biệt latency và loss; chưa dùng log GC |
 | Vòng kiểm chứng bắt đáp án thiếu căn cứ | Kiểm chứng còn lỏng; hết lượt vẫn nộp đáp án chưa kiểm chứng |
 

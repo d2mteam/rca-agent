@@ -1,16 +1,21 @@
 """Investigation tools an LLM agent calls from the shell, one case at a time.
 
 Every tool sees only the query and the telemetry; none of them reveals the
-graded faults. The normal level comes from the hour before the window, or from
-the same clock time on 2021-03-05 when that hour is not loaded.
+graded faults. The tools hold no knowledge of what a signal means: raw ones show
+the data, statistical ones rank what departed from normal. Reading meaning into
+metric names and log lines is left to the agent. The normal level comes from the
+hour before the window, or from the same clock time on 2021-03-05 when that hour
+is not loaded.
 
-  question  the query, the answer space and how to submit
-  overview  symptoms: business KPIs per minute, log and span volume vs normal
-  anomalies metric series ranked by z-score against the normal level
-  series    one component's KPIs minute by minute
-  traces    MicroRank and TraceRCA rankings of traced components
-  logs      log volume per minute and sample lines of one component
-  submit    record the answer for the case
+  question   the query, the answer space, the tools and how to submit
+  overview   business KPIs per minute, log and span volume vs normal      (raw)
+  calls      caller -> callee pairs seen in the traces, vs normal          (raw)
+  series     KPIs of one component minute by minute                        (raw)
+  logs       log lines of one component, optionally grepped, per minute   (raw)
+  baro       metric series ranked by BARO (BOCPD + RobustScorer)   (statistical)
+  exclusive  exclusive-time rises per component, from the traces   (statistical)
+  traces     MicroRank ranking of traced components               (statistical)
+  submit     record the answer for the case
 """
 
 import json
@@ -19,7 +24,7 @@ from pathlib import Path
 
 import duckdb
 
-from rca import bank, microrank, statistical, tracerca
+from rca import bank, exclusive_time, hypotheses, microrank, statistical
 from rca.cases import CST, Case
 from rca.scoring import TIME_FORMAT, Answer, write_predictions
 
@@ -36,13 +41,36 @@ def _reference(con: duckdb.DuckDBPyConnection, case: Case) -> tuple[int, int, st
     return start, end, "2021-03-05 (a normal day) around the same clock time"
 
 
-def question(con: duckdb.DuckDBPyConnection, case: Case) -> None:
-    print(case.instruction)
+def question(con: duckdb.DuckDBPyConnection, case: Case, protocol: str = "hypotheses") -> None:
+    print(case.instruction or "A normal window: no fault was injected and there is nothing to submit.")
     print(f"\nWindow: {datetime.fromtimestamp(case.start, CST):%Y-%m-%d %H:%M} to {datetime.fromtimestamp(case.end, CST):%Y-%m-%d %H:%M} (UTC+8)")
-    print("Components:", ", ".join(bank.COMPONENTS))
-    print("Reasons:", "; ".join(bank.REASONS))
-    print("Traces cover IG, Tomcat, MG and docker only; apache, Mysql and Redis show up in metrics and logs.")
-    print(f'Submit one answer per failure: python -m rca tool submit {case.case_id} --time "YYYY-MM-DD HH:MM:SS" --component X --reason "..."')
+    print("Components (answer with one of these):", ", ".join(bank.COMPONENTS))
+    print("Reasons (answer with one of these):", "; ".join(bank.REASONS))
+    print(f"""
+Tools, all run as python -m rca tool <name> {case.case_id} ...:
+  overview                         business KPIs per minute; log lines and spans per component vs normal
+  calls                            caller -> callee pairs in the traces: volume and call duration vs normal
+  series <component> <pattern>     KPIs of a component whose name contains <pattern>, minute by minute
+                                   (an empty pattern "" lists every KPI name of the component)
+  logs <component> [--grep TEXT] [--samples N]
+                                   log lines per minute and sample lines, optionally only those containing TEXT
+  baro [--component C] [--top N]   metric series ranked by BARO: change point, then robust score per series
+  exclusive                        rises in exclusive time per component, from the traces
+  traces                           MicroRank ranking of traced components
+""")
+    if protocol == "free":
+        print(f"""Submit one answer per failure (add --append for the second and later):
+  python -m rca tool --protocol free submit {case.case_id} --time "YYYY-MM-DD HH:MM:SS" --component X --reason "..."
+""")
+        return
+    print(f"""Work by hypotheses. Each one is a candidate cause with what you expect to observe if it is true and if it is false:
+  hypothesis {case.case_id} add --component X --reason "..." --if-true "..." --if-false "..."
+  hypothesis {case.case_id} test <id> --status supported|refuted|open --evidence "tool, numbers"
+  hypothesis {case.case_id} list
+Submit one answer per failure (add --append for the second and later). An answer is accepted only when it
+matches a supported hypothesis and at least one other hypothesis was refuted:
+  python -m rca tool submit {case.case_id} --time "YYYY-MM-DD HH:MM:SS" --component X --reason "..."
+""")
 
 
 def overview(con: duckdb.DuckDBPyConnection, case: Case) -> None:
@@ -77,15 +105,49 @@ def overview(con: duckdb.DuckDBPyConnection, case: Case) -> None:
         print(f"  {cmdb:9} {now:7d}  normal {normal:9.0f}   duration {d_now or 0:8.1f}  normal {d_normal or 0:8.1f}")
 
 
-def anomalies(con: duckdb.DuckDBPyConnection, case: Case, component: str | None, top: int) -> None:
-    findings = statistical.rank_findings(con, case, "zscore", "before")
+def calls(con: duckdb.DuckDBPyConnection, case: Case) -> None:
+    ref_start, ref_end, ref_name = _reference(con, case)
+    scale = (case.end - case.start) / (ref_end - ref_start)
+    print(f"Normal level: {ref_name}. A call is a span whose child span is on another component;")
+    print("its duration is the caller's span. Counts are scaled to the window length.\n")
+    print(f"{'caller':9} -> {'callee':9} {'calls':>8} {'normal':>8}  {'mean ms':>9} {'normal':>9}")
+    for caller, callee, now, normal, d_now, d_normal in con.execute(
+        """WITH s AS (SELECT trace_id, span_id, parent_id, cmdb_id, duration, ts >= ? AS win FROM trace
+                      WHERE (ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?))
+           SELECT p.cmdb_id, c.cmdb_id, count(*) FILTER (WHERE p.win), count(*) FILTER (WHERE NOT p.win) * ?,
+                  avg(p.duration) FILTER (WHERE p.win), avg(p.duration) FILTER (WHERE NOT p.win)
+           FROM s p JOIN s c ON c.trace_id = p.trace_id AND c.parent_id = p.span_id AND c.span_id <> c.parent_id
+           WHERE c.cmdb_id <> p.cmdb_id GROUP BY ALL ORDER BY 1, 2""",
+        [case.start, case.start, case.end, ref_start, ref_end, scale],
+    ).fetchall():
+        print(f"{caller:9} -> {callee:9} {now:8d} {normal:8.0f}  {d_now or 0:9.1f} {d_normal or 0:9.1f}")
+
+
+def baro_ranking(con: duckdb.DuckDBPyConnection, case: Case, component: str | None, top: int) -> None:
+    from rca import baro  # optional dependency group "baro"
+
+    split, ranked = baro.rank_series(con, case)
     if component:
-        findings = [f for f in findings if f.component == component]
-    print("Metric series of the window ranked by z-score = |value - normal mean| / normal std.")
-    print("onset = first minute with z >= 3 (or the peak). reason = the fault type this KPI usually indicates.\n")
-    print(f"{'component':9} {'z':>8}  onset  {'peak':>12} {'normal':>12}  reason / kpi")
-    for f in findings[:top]:
-        print(f"{f.component:9} {f.score:8.1f}  {_hm(f.onset)}  {f.value:12.2f} {f.centre:12.2f}  {f.reason} / {f.kpi}")
+        ranked = [r for r in ranked if r.column.startswith(component + "|")]
+    print("BARO: BOCPD over all metric series finds the change point; each series is then scored")
+    print("max((x - median) / IQR) after it, against the minutes before. onset = first minute scoring 3 or more.")
+    print(f"Change point: {_hm(split)}" + ("" if split >= case.start else " (before the window: none inside it)") + "\n")
+    print(f"{'score':>8}  onset  {'median':>12} {'peak':>12}  series")
+    for r in ranked[:top]:
+        print(f"{r.score:8.1f}  {_hm(r.onset)}  {r.centre:12.2f} {r.peak:12.2f}  {r.column}")
+
+
+def exclusive(con: duckdb.DuckDBPyConnection, case: Case) -> None:
+    print("Exclusive time = a span's duration minus the durations of the spans it calls, per minute and component:")
+    print("  processing  the component's own spans")
+    print("  network in  calls reaching the component: the caller's call span minus the component's span")
+    print("Scored (x - median) / IQR against the hour before; listed when 3 or more, strongest first.\n")
+    found = exclusive_time.changes(con, case)
+    for c in found:
+        print(f"{c.component:9} {c.kind:10} {c.normal_ms:8.1f} -> {c.peak_ms:8.1f} ms  score {c.score:7.1f}  "
+              f"{_hm(c.start)}-{_hm(c.end)}")
+    if not found:
+        print("no rise")
 
 
 def series(con: duckdb.DuckDBPyConnection, case: Case, component: str, kpi: str) -> None:
@@ -115,16 +177,11 @@ def series(con: duckdb.DuckDBPyConnection, case: Case, component: str, kpi: str)
 
 
 def traces(con: duckdb.DuckDBPyConnection, case: Case) -> None:
-    print("MicroRank: a trace is abnormal when slower than the sum of its spans' normal mean+std plus 50 ms;")
-    print("PageRank over the trace graph + spectrum score. Higher = more suspicious.")
+    print("MicroRank: a trace is abnormal when slower than the 99th percentile of same-shaped traces in the hour")
+    print("before, or when a call that normally reaches its callee left no span there. Personalised PageRank over")
+    print("the operation-trace graph, then Ochiai spectrum score. Higher = more suspicious.")
     ranks = microrank.rank_components(con, case)
-    print("  " + (", ".join(f"{c} {s:.3g}" for c, s in ranks[:8]) if ranks else "no result (no normal hour or no abnormal traces)"))
-    print("\nTraceRCA: share of abnormal traces (a span slower than normal mean+3std) passing the component, Jaccard.")
-    suspects = tracerca.rank_components(con, case)
-    for s in suspects[:8]:
-        print(f"  {s.component:9} {s.score:.3f}  abnormal traces through it {s.abnormal_traces}, normal {s.normal_traces}")
-    if not suspects:
-        print("  no result (no normal hour)")
+    print("  " + (", ".join(f"{c} {s:.3g}" for c, s in ranks[:8]) if ranks else "no result (no normal hour, or every trace abnormal or every trace normal)"))
 
 
 def logs(con: duckdb.DuckDBPyConnection, case: Case, component: str, grep: str | None, samples: int) -> None:
@@ -150,12 +207,17 @@ def logs(con: duckdb.DuckDBPyConnection, case: Case, component: str, grep: str |
         print(f"  {_hm(ts)} [{name}] {value[:220]}")
 
 
-def submit(case: Case, answers_dir: Path, time: str, component: str, reason: str, append: bool) -> None:
+def submit(case: Case, answers_dir: Path, time: str, component: str, reason: str, append: bool,
+           protocol: str = "hypotheses") -> None:
     datetime.strptime(time, TIME_FORMAT)
     if component not in bank.COMPONENTS:
         raise SystemExit(f"unknown component {component!r}; choose from {', '.join(bank.COMPONENTS)}")
     if reason not in bank.REASONS:
         raise SystemExit(f"unknown reason {reason!r}; choose from {'; '.join(bank.REASONS)}")
+    refused = protocol == "hypotheses" and hypotheses.check_answer(
+        hypotheses.load(answers_dir.parent, case.case_id), component, reason)
+    if refused:
+        raise SystemExit(f"not recorded: {refused}")
     path = answers_dir / f"{case.case_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     answers = json.loads(path.read_text()) if append and path.exists() else []
