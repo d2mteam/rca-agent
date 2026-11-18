@@ -1,4 +1,4 @@
-"""Command line: prepare data, list cases, write baseline answers, investigate, run the workflow, score."""
+"""Command line: prepare data, list cases, write baseline answers, investigate a case, score."""
 
 import argparse
 import json
@@ -101,63 +101,6 @@ def cmd_score(args: argparse.Namespace) -> None:
             print(report.case_lines(scores))
 
 
-def cmd_workflow(args: argparse.Namespace) -> None:
-    from rca import workflow  # needs the optional group "baro"
-
-    con = connect(args.data / "parquet" / args.system)
-    run_dir = args.runs / (args.run or f"workflow-{args.model.replace(':', '_').replace('/', '_')}")
-    (run_dir / "reports").mkdir(parents=True, exist_ok=True)
-    predictions = load_predictions(run_dir / "predictions.jsonl") if (run_dir / "predictions.jsonl").exists() else {}
-    for c in [c for c in _cases(args) if not args.cases or c.case_id in args.cases]:
-        started = datetime.now()
-        try:
-            predictions[c.case_id], report_ = workflow.run(con, c, args.model, args.url)
-        except OSError as error:  # a timed-out or refused model call loses this case only
-            print(f"{c.case_id}: failed ({error})", flush=True)
-            continue
-        (run_dir / "reports" / f"{c.case_id}.json").write_text(json.dumps(asdict(report_), indent=1, ensure_ascii=False))
-        write_predictions(run_dir / "predictions.jsonl", predictions)
-        print(f"{c.case_id}: {len(report_.attempts)} attempt(s), {(datetime.now() - started).seconds}s", flush=True)
-    print(f"answers -> {run_dir / 'predictions.jsonl'}")
-
-
-def cmd_flow(args: argparse.Namespace) -> None:
-    """Workflow steps for an agent that is the deciding LLM: print the prompt, or verify and record answers."""
-    from rca import workflow  # needs the optional group "baro"
-
-    case = next((c for c in load_cases(args.data / "openrca" / args.system) if c.case_id == args.case_id), None)
-    if case is None:
-        raise SystemExit(f"no case {args.case_id}")
-    con = connect(args.data / "parquet" / args.system)
-    prompt, evidence_of, drops, report_ = workflow.build(con, case)
-    if args.step == "prompt":
-        print(prompt)
-        print(f'\nAnswer with: python -m rca flow submit {case.case_id} --answers \'<JSON>\'  where JSON is '
-              f'{{"answers": [{len(case.faults)} x {{"component", "reason", "onset_minute": "HH:MM", "why"}}], "confidence"}}')
-        return
-    run_dir = args.runs / args.run
-    parsed = json.loads(args.answers)
-    picks = parsed["answers"][:len(case.faults)]
-    wrong = [f"{p.get('component')!r} / {p.get('reason')!r}" for p in picks
-             if p.get("component") not in bank.COMPONENTS or p.get("reason") not in bank.REASONS]
-    if wrong:
-        raise SystemExit(f"Not in the allowed lists: {', '.join(wrong)}. Use the exact component and reason strings "
-                         "from the prompt; this submission was not counted.")
-    problems = workflow.verify(case, picks, evidence_of, drops)
-    (run_dir / "attempts").mkdir(parents=True, exist_ok=True)
-    with open(run_dir / "attempts" / f"{case.case_id}.jsonl", "a") as log:
-        log.write(json.dumps({"answer": parsed, "problems": problems, "final": args.final}) + "\n")
-    if problems and not args.final:
-        print("Verification failed:\n- " + "\n- ".join(problems) + "\nRe-read the evidence and submit again "
-              "(add --final on your last try).")
-        return
-    path = run_dir / "predictions.jsonl"
-    predictions = load_predictions(path) if path.exists() else {}
-    predictions[case.case_id] = workflow.answers_of(case, picks)
-    write_predictions(path, predictions)
-    print(f"{case.case_id}: recorded" + (" (unverified)" if problems else ""))
-
-
 def _normal_window(case_id: str, cases) -> Case | None:
     """normal-YYYY_MM_DD-HHMM: 30 minutes with no query, at least an hour away from every query window."""
     match = re.fullmatch(r"normal-(\d{4}_\d{2}_\d{2})-([01]\d|2[0-3])([0-5]\d)", case_id)
@@ -202,6 +145,8 @@ def cmd_tool(args: argparse.Namespace) -> None:
         tools.baro_ranking(con, case, args.component, args.top)
     elif args.tool == "exclusive":
         tools.exclusive(con, case)
+    elif args.tool == "onset":
+        tools.onsets(con, case, args.component, args.pattern, args.top)
     elif args.tool == "series":
         tools.series(con, case, args.component, args.kpi)
     elif args.tool == "traces":
@@ -242,25 +187,6 @@ def main() -> None:
     score.add_argument("--detail", action="store_true", help="add per-reason and per-case breakdowns")
     score.set_defaults(func=cmd_score)
 
-    flow = sub.add_parser("workflow", help="code-led workflow: BARO + graph tools, a local Ollama model decides")
-    flow.add_argument("--model", default="qwen3:4b-instruct-2507-q4_K_M")
-    flow.add_argument("--url", default="http://localhost:11434")
-    flow.add_argument("--cases", nargs="*", help="only these case ids")
-    flow.add_argument("--days", nargs="*", default=EVAL_DAYS)
-    flow.add_argument("--run", help="run name; default workflow-<model>")
-    flow.set_defaults(func=cmd_workflow)
-
-    flow = sub.add_parser("flow", help="workflow steps for an agent acting as the deciding LLM")
-    flow.set_defaults(func=cmd_flow)
-    steps = flow.add_subparsers(dest="step", required=True)
-    p = steps.add_parser("prompt")
-    p.add_argument("case_id")
-    p = steps.add_parser("submit")
-    p.add_argument("case_id")
-    p.add_argument("--answers", required=True, help="the JSON answer")
-    p.add_argument("--final", action="store_true", help="record even if verification fails")
-    p.add_argument("--run", default="workflow-sonnet")
-
     tool = sub.add_parser("tool", help="investigation tools for an agent working on one case")
     tool.set_defaults(func=cmd_tool)
     tool.add_argument("--protocol", choices=["hypotheses", "free"], default="hypotheses",
@@ -272,6 +198,11 @@ def main() -> None:
     p.add_argument("case_id")
     p.add_argument("--component", choices=bank.COMPONENTS)
     p.add_argument("--top", type=int, default=20)
+    p = kinds.add_parser("onset")
+    p.add_argument("case_id")
+    p.add_argument("component", choices=bank.COMPONENTS)
+    p.add_argument("--pattern", help="only series whose name contains this text")
+    p.add_argument("--top", type=int, default=25)
     p = kinds.add_parser("series")
     p.add_argument("case_id")
     p.add_argument("component", choices=bank.COMPONENTS)

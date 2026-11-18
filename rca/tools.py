@@ -15,6 +15,7 @@ is not loaded.
   baro       metric series ranked by BARO (BOCPD + RobustScorer)   (statistical)
   exclusive  exclusive-time rises per component, from the traces   (statistical)
   traces     MicroRank ranking of traced components               (statistical)
+  onset      when one component started to deviate, and when its callers did   (verification)
   submit     record the answer for the case
 """
 
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import duckdb
 
-from rca import bank, exclusive_time, hypotheses, microrank, statistical
+from rca import bank, exclusive_time, hypotheses, microrank, onset, statistical
 from rca.cases import CST, Case
 from rca.scoring import TIME_FORMAT, Answer, write_predictions
 
@@ -57,6 +58,8 @@ Tools, all run as python -m rca tool <name> {case.case_id} ...:
   baro [--component C] [--top N]   metric series ranked by BARO: change point, then robust score per series
   exclusive                        rises in exclusive time per component, from the traces
   traces                           MicroRank ranking of traced components
+  onset <component> [--pattern P]  when that component's series started to deviate, and when the components
+                                   calling it (from the traces) did: to check a hypothesis's onset and order
 """)
     if protocol == "free":
         print(f"""Submit one answer per failure (add --append for the second and later):
@@ -182,6 +185,33 @@ def traces(con: duckdb.DuckDBPyConnection, case: Case) -> None:
     print("the operation-trace graph, then Ochiai spectrum score. Higher = more suspicious.")
     ranks = microrank.rank_components(con, case)
     print("  " + (", ".join(f"{c} {s:.3g}" for c, s in ranks[:8]) if ranks else "no result (no normal hour, or every trace abnormal or every trace normal)"))
+
+
+def onsets(con: duckdb.DuckDBPyConnection, case: Case, component: str, pattern: str | None, top: int) -> None:
+    print(f"Deviations of {component}{f' (series containing {pattern!r})' if pattern else ''}: 2+ consecutive samples above")
+    print("warning against the 15 samples before (percentile levels if the baseline sits on one value,")
+    print("z levels otherwise), onset moved back over the moderate samples just before. Counters are")
+    print("tested on their differences. Sorted by onset.\n")
+    found = onset.deviations(con, case, component, pattern)
+    print(f"{'onset':5}  {'samples':>7}  {'level':8}  {'baseline':>12} -> {'peak':>12}  series")
+    for d in found[:top]:
+        print(f"{_hm(d.onset)}  {d.samples:7d}  {onset.LEVELS[d.level]:8}  {d.baseline:12.4g} -> {d.peak:12.4g}  "
+              f"{d.series}{' (differences)' if d.differenced else ''}")
+    if not found:
+        print("no deviation")
+    elif len(found) > top:
+        print(f"... {len(found) - top} more; narrow with --pattern")
+    first = found[0].onset if found else None
+    print(f"\nComponents calling {component} (from the traces), by hops, and when their span duration deviated:")
+    rows = onset.caller_onsets(con, case, component)
+    for caller, hops, d in rows:
+        if d is None:
+            print(f"  {caller:9} {hops} hop(s): no deviation")
+            continue
+        order = "" if first is None else ("  (before " + component + "'s first deviation)" if d.onset < first - 60 else "")
+        print(f"  {caller:9} {hops} hop(s): from {_hm(d.onset)}, {d.samples} samples, {d.baseline:.1f} -> {d.peak:.1f} ms{order}")
+    if not rows:
+        print("  none in the traces")
 
 
 def logs(con: duckdb.DuckDBPyConnection, case: Case, component: str, grep: str | None, samples: int) -> None:
