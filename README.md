@@ -404,7 +404,7 @@ flowchart TD
     subgraph S2["2. Viết hồ sơ hệ thống (một lần)"]
         NW["6 cửa sổ khỏe<br/>normal-YYYY_MM_DD-HHMM"]
         PA["Agent khảo sát<br/>bằng các công cụ"]
-        PF["profiles/&lt;hệ&gt;.md<br/>ai gọi ai, mức bình thường,<br/>nhiễu thường gặp"]
+        PF["profiles/bank.md, telecom.md<br/>ai gọi ai, mức bình thường,<br/>nhiễu thường gặp"]
         NW --> PA --> PF
     end
 
@@ -424,7 +424,7 @@ flowchart TD
     end
 
     subgraph S4["4. Chấm điểm và cải tiến (người phát triển)"]
-        PRED["runs/&lt;run&gt;/predictions.jsonl"]
+        PRED["runs/tên-run/predictions.jsonl"]
         SC["python -m rca score<br/>luật OpenRCA"]
         REC["record.csv<br/>đáp án đúng"]
         FIX["Xem câu sai,<br/>sửa công cụ hoặc hồ sơ"]
