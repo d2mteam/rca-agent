@@ -393,32 +393,52 @@ Pipeline có bốn giai đoạn. Hai giai đoạn đầu chỉ làm một lần 
 đoạn 3 lặp lại cho từng câu hỏi. Giai đoạn 4 là việc của người phát triển, giữa các
 lần chạy.
 
-```text
-1. CHUẨN BỊ DỮ LIỆU (một lần)
-│  CSV của OpenRCA (metric, log, trace theo ngày)
-│     ──python -m rca prepare──> Parquet: 4 bảng chung cho mọi hệ
-│                                metric_app, metric_container, trace, log
-▼
-2. VIẾT HỒ SƠ HỆ THỐNG (một lần)
-│  một agent chạy các công cụ trên 6 cửa sổ khỏe (normal-YYYY_MM_DD-HHMM)
-│     ──> profiles/<hệ>.md: ai gọi ai, mức bình thường, công cụ báo gì khi không lỗi
-▼
-3. GIẢI CÂU HỎI (lặp cho từng câu)
-│  agent đọc hồ sơ, chạy  tool question <câu>  → đề bài, 30 phút, danh sách đáp án
-│
-│  ┌─► agent chọn một công cụ
-│  │      công cụ đọc Parquet (30 phút + giờ trước đó), so sánh, chấm điểm
-│  │      → in một bảng chữ ngắn
-│  │   agent đọc bảng, nêu hoặc kiểm giả thuyết (hypothesis add / test)
-│  └── lặp lại, khoảng 15–25 lệnh mỗi câu
-│
-│  submit: chỉ nhận nếu có 1 giả thuyết được ủng hộ và 1 giả thuyết khác bị bác
-│     ──> runs/<run>/answers/<câu>.json, runs/<run>/predictions.jsonl
-▼
-4. CHẤM ĐIỂM VÀ CẢI TIẾN (người phát triển)
-   python -m rca score: so đáp án với record.csv theo luật OpenRCA → điểm
-   soát lại các lệnh agent đã chạy (không được đọc đáp án hay mã nguồn)
-   xem các câu sai → sửa công cụ hoặc hồ sơ → chạy lại, chấm trên các câu chưa dùng
+```mermaid
+flowchart TD
+    subgraph S1["1. Chuẩn bị dữ liệu (một lần)"]
+        CSV["CSV của OpenRCA<br/>metric, log, trace theo ngày"]
+        PQ[("Parquet: 4 bảng chung<br/>metric_app, metric_container,<br/>trace, log")]
+        CSV -- "python -m rca prepare" --> PQ
+    end
+
+    subgraph S2["2. Viết hồ sơ hệ thống (một lần)"]
+        NW["6 cửa sổ khỏe<br/>normal-YYYY_MM_DD-HHMM"]
+        PA["Agent khảo sát<br/>bằng các công cụ"]
+        PF["profiles/&lt;hệ&gt;.md<br/>ai gọi ai, mức bình thường,<br/>nhiễu thường gặp"]
+        NW --> PA --> PF
+    end
+
+    subgraph S3["3. Giải một câu hỏi (lặp cho từng câu)"]
+        Q["tool question<br/>đề bài, 30 phút, danh sách đáp án"]
+        A{"Agent LLM<br/>suy luận"}
+        T["Công cụ: overview, calls, series, logs,<br/>baro, exclusive, traces, onset"]
+        OUT["Bảng chữ ngắn"]
+        H["Sổ giả thuyết<br/>hypothesis add / test"]
+        SUB["submit<br/>chỉ nhận khi 1 giả thuyết được ủng hộ<br/>và 1 giả thuyết khác bị bác"]
+        Q --> A
+        A -- "chọn công cụ" --> T
+        T --> OUT
+        OUT -- "đọc kết quả" --> A
+        A <--> H
+        A -- "đủ bằng chứng" --> SUB
+    end
+
+    subgraph S4["4. Chấm điểm và cải tiến (người phát triển)"]
+        PRED["runs/&lt;run&gt;/predictions.jsonl"]
+        SC["python -m rca score<br/>luật OpenRCA"]
+        REC["record.csv<br/>đáp án đúng"]
+        FIX["Xem câu sai,<br/>sửa công cụ hoặc hồ sơ"]
+        PRED --> SC
+        REC --> SC
+        SC --> FIX
+    end
+
+    PQ --> PA
+    PQ --> T
+    PF --> A
+    SUB --> PRED
+    FIX -. "chạy lại trên câu chưa dùng" .-> T
+    FIX -.-> PF
 ```
 
 | Giai đoạn | Nhận vào | Trả ra | Mã nguồn |
