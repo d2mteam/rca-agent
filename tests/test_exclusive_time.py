@@ -1,6 +1,6 @@
 import duckdb
 
-from rca import exclusive_time
+from rca import exclusive_time, telemetry
 from rca.cases import Case
 
 START = 1_615_266_000  # a window start, on a whole minute
@@ -14,7 +14,8 @@ def traces(slow_from: int, tomcat_ms: int, network_ms: int, minutes_before: int 
     """One trace per minute: IG01 serves, calls Tomcat01 and spends 3 ms of its own; from minute
     `slow_from` of the window, Tomcat01 works `tomcat_ms` and the call spends `network_ms` on the way."""
     con = duckdb.connect()
-    con.execute("CREATE TABLE trace (ts DOUBLE, cmdb_id VARCHAR, parent_id VARCHAR, span_id VARCHAR, trace_id VARCHAR, duration BIGINT)")
+    con.execute("CREATE TABLE raw (ts DOUBLE, cmdb_id VARCHAR, parent_id VARCHAR, span_id VARCHAR, trace_id VARCHAR, duration BIGINT)")
+    con.execute(f"CREATE VIEW trace AS SELECT {telemetry.VIEW_COLUMNS['Bank']['trace']} FROM raw")
     rows = []
     for minute in range(-minutes_before, 30):
         work, gap = (tomcat_ms, network_ms) if minute >= slow_from else (20, 2)
@@ -24,7 +25,7 @@ def traces(slow_from: int, tomcat_ms: int, network_ms: int, minutes_before: int 
             (ts, "IG01", f"r{minute}", f"369-c{minute}", trace, work + gap),
             (ts, "Tomcat01", f"369-c{minute}", f"s{minute}", trace, work),
         ]
-    con.executemany("INSERT INTO trace VALUES (?, ?, ?, ?, ?, ?)", rows)
+    con.executemany("INSERT INTO raw VALUES (?, ?, ?, ?, ?, ?)", rows)
     return con
 
 

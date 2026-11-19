@@ -14,11 +14,14 @@ Every traced component gets two minute series over the hour before the window an
   processing  mean exclusive time of its server spans: work done inside it
   network in  mean exclusive time of the call spans that reach it, i.e. the caller's call minus
               the component's server span: time spent on the network and in its queue
+A call whose callee leaves no span but is named by the trace (Telecom's JDBC calls name their
+database) counts whole as the callee's network in: the database's own work cannot be told apart.
+Telecom traces are taken to be serial too; that is not checked.
 A series scores (x - median) / IQR per minute against the hour before; durations are whole
 milliseconds, so an IQR below 1 ms counts as 1 ms.
 Its change is the run of consecutive minutes scoring 3 or more that holds its peak. Components
-rank by their highest-scoring change. Components outside the answer space (docker) are left out,
-as are calls whose callee left no span.
+rank by their highest-scoring change. Components outside the answer space (Bank's docker) are
+left out, as are calls whose callee is neither in the trace nor named by it.
 """
 
 from dataclasses import dataclass
@@ -26,7 +29,7 @@ from dataclasses import dataclass
 import duckdb
 import numpy as np
 
-from rca import bank
+from rca import systems
 from rca.cases import Case
 
 THRESHOLD = 3.0
@@ -34,16 +37,16 @@ MIN_REFERENCE_MINUTES = 10
 RESOLUTION_MS = 1.0
 
 SERIES = """
-WITH s AS (SELECT trace_id, span_id, parent_id, cmdb_id, span_id LIKE '369-%' AS is_call, duration, ts
+WITH s AS (SELECT trace_id, span_id, parent_id, cmdb_id, is_call, call_target, duration, ts
            FROM trace WHERE ts >= ? AND ts < ?),
      children AS (SELECT trace_id, parent_id AS span_id, sum(duration) AS busy, any_value(cmdb_id) AS callee
                   FROM s WHERE parent_id <> span_id GROUP BY ALL)
-SELECT CASE WHEN s.is_call THEN c.callee ELSE s.cmdb_id END AS component,
+SELECT CASE WHEN s.is_call THEN coalesce(c.callee, s.call_target) ELSE s.cmdb_id END AS component,
        CASE WHEN s.is_call THEN 'network in' ELSE 'processing' END AS kind,
        CAST(floor(s.ts / 60) * 60 AS BIGINT) AS minute,
        avg(greatest(s.duration - coalesce(c.busy, 0), 0)) AS exclusive_ms
 FROM s LEFT JOIN children c USING (trace_id, span_id)
-WHERE NOT s.is_call OR c.callee IS NOT NULL
+WHERE NOT s.is_call OR coalesce(c.callee, s.call_target) IS NOT NULL
 GROUP BY ALL
 ORDER BY component, kind, minute
 """
@@ -63,8 +66,9 @@ class Change:
 def changes(con: duckdb.DuckDBPyConnection, case: Case) -> list[Change]:
     """Every series whose exclusive time rose 3 or more, strongest first."""
     series: dict[tuple[str, str], list[tuple[int, float]]] = {}
+    components = systems.get(case.system).components
     for component, kind, minute, value in con.execute(SERIES, [case.start - 3600, case.end]).fetchall():
-        if component in bank.COMPONENTS:
+        if component in components:
             series.setdefault((component, kind), []).append((minute, value))
     found = []
     for (component, kind), points in series.items():

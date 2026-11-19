@@ -4,8 +4,8 @@ Every tool sees only the query and the telemetry; none of them reveals the
 graded faults. The tools hold no knowledge of what a signal means: raw ones show
 the data, statistical ones rank what departed from normal. Reading meaning into
 metric names and log lines is left to the agent. The normal level comes from the
-hour before the window, or from the same clock time on 2021-03-05 when that hour
-is not loaded.
+hour before the window, or, on Bank, from the same clock time on 2021-03-05 when
+that hour is not loaded. Every tool reads the case's system through the same views.
 
   question   the query, the answer space, the tools and how to submit
   overview   business KPIs per minute, log and span volume vs normal      (raw)
@@ -25,9 +25,10 @@ from pathlib import Path
 
 import duckdb
 
-from rca import bank, exclusive_time, hypotheses, microrank, onset, statistical
+from rca import exclusive_time, hypotheses, microrank, onset, statistical, systems
 from rca.cases import CST, Case
 from rca.scoring import TIME_FORMAT, Answer, write_predictions
+from rca.telemetry import has_view
 
 
 def _hm(ts: float) -> str:
@@ -36,17 +37,21 @@ def _hm(ts: float) -> str:
 
 def _reference(con: duckdb.DuckDBPyConnection, case: Case) -> tuple[int, int, str]:
     rows = con.execute("SELECT count(*) FROM metric_app WHERE ts >= ? AND ts < ?", [case.start - 3600, case.start]).fetchone()[0]
-    if rows:
-        return case.start - 3600, case.start, "the hour before the window"
+    normal_day = systems.get(case.system).normal_day
+    if rows or normal_day is None:
+        return case.start - 3600, case.start, "the hour before the window" + ("" if rows else " (no business KPIs there)")
     start, end = statistical.reference_period(case, "normal-day")
-    return start, end, "2021-03-05 (a normal day) around the same clock time"
+    return start, end, f"{normal_day} (a normal day) around the same clock time"
 
 
 def question(con: duckdb.DuckDBPyConnection, case: Case, protocol: str = "hypotheses") -> None:
+    space = systems.get(case.system)
     print(case.instruction or "A normal window: no fault was injected and there is nothing to submit.")
     print(f"\nWindow: {datetime.fromtimestamp(case.start, CST):%Y-%m-%d %H:%M} to {datetime.fromtimestamp(case.end, CST):%Y-%m-%d %H:%M} (UTC+8)")
-    print("Components (answer with one of these):", ", ".join(bank.COMPONENTS))
-    print("Reasons (answer with one of these):", "; ".join(bank.REASONS))
+    print("Components (answer with one of these):", ", ".join(space.components))
+    print("Reasons (answer with one of these):", "; ".join(space.reasons))
+    if not has_view(con, "log"):
+        print("This system has no logs: the logs tool and the log part of overview are empty.")
     print(f"""
 Tools, all run as python -m rca tool <name> {case.case_id} ...:
   overview                         business KPIs per minute; log lines and spans per component vs normal
@@ -82,27 +87,30 @@ def overview(con: duckdb.DuckDBPyConnection, case: Case) -> None:
     print(f"Normal level: {ref_name}\n")
 
     ref = con.execute("SELECT avg(sr), avg(mrt), sum(cnt) * ? FROM metric_app WHERE ts >= ? AND ts < ?", [scale, ref_start, ref_end]).fetchone()
-    print(f"Business KPIs, all services (normal: success {ref[0]:.1f}%, response {ref[1]:.0f} ms, {ref[2] / 30:.0f} requests/min)")
-    print("minute  success%  response_ms  requests")
+    if ref[0] is not None:
+        print(f"Business KPIs, all services (normal: success {ref[0]:.1f}%, mean response {ref[1]:.4g}, {ref[2] / 30:.0f} requests/min)")
+    print("minute  success%  mean_response  requests")
     for ts, sr, mrt, cnt in con.execute(
         "SELECT ts, avg(sr), avg(mrt), sum(cnt) FROM metric_app WHERE ts >= ? AND ts < ? GROUP BY ts ORDER BY ts",
         [case.start, case.end],
     ).fetchall():
-        print(f"{_hm(ts)}   {sr:7.1f}  {mrt:11.0f}  {cnt:8d}")
+        print(f"{_hm(ts)}   {sr:7.1f}  {mrt:13.4g}  {cnt:8d}")
 
-    print("\nLog lines per component and log (window vs normal, scaled to the window length)")
-    for cmdb, name, now, normal in con.execute(
-        """SELECT cmdb_id, log_name, count(*) FILTER (WHERE ts >= ?) AS now, count(*) FILTER (WHERE ts < ?) * ? AS normal
-           FROM log WHERE (ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?) GROUP BY ALL ORDER BY cmdb_id, log_name""",
-        [case.start, case.start, scale, case.start, case.end, ref_start, ref_end],
-    ).fetchall():
-        print(f"  {cmdb:9} {name:22} {now:7d}  normal {normal:9.0f}")
+    if has_view(con, "log"):
+        print("\nLog lines per component and log (window vs normal, scaled to the window length)")
+        for cmdb, name, now, normal in con.execute(
+            """SELECT cmdb_id, log_name, count(*) FILTER (WHERE ts >= ?) AS now, count(*) FILTER (WHERE ts < ?) * ? AS normal
+               FROM log WHERE (ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?) GROUP BY ALL ORDER BY cmdb_id, log_name""",
+            [case.start, case.start, scale, case.start, case.end, ref_start, ref_end],
+        ).fetchall():
+            print(f"  {cmdb:9} {name:22} {now:7d}  normal {normal:9.0f}")
 
     print("\nSpans per component (window vs normal; mean duration ms)")
     for cmdb, now, normal, d_now, d_normal in con.execute(
         """SELECT cmdb_id, count(*) FILTER (WHERE ts >= ?), count(*) FILTER (WHERE ts < ?) * ?,
                   avg(duration) FILTER (WHERE ts >= ?), avg(duration) FILTER (WHERE ts < ?)
-           FROM trace WHERE (ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?) GROUP BY ALL ORDER BY cmdb_id""",
+           FROM trace WHERE ((ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?)) AND cmdb_id IS NOT NULL
+           GROUP BY ALL ORDER BY cmdb_id""",
         [case.start, case.start, scale, case.start, case.start, case.start, case.end, ref_start, ref_end],
     ).fetchall():
         print(f"  {cmdb:9} {now:7d}  normal {normal:9.0f}   duration {d_now or 0:8.1f}  normal {d_normal or 0:8.1f}")
@@ -111,16 +119,21 @@ def overview(con: duckdb.DuckDBPyConnection, case: Case) -> None:
 def calls(con: duckdb.DuckDBPyConnection, case: Case) -> None:
     ref_start, ref_end, ref_name = _reference(con, case)
     scale = (case.end - case.start) / (ref_end - ref_start)
-    print(f"Normal level: {ref_name}. A call is a span whose child span is on another component;")
-    print("its duration is the caller's span. Counts are scaled to the window length.\n")
+    print(f"Normal level: {ref_name}. A call is a span whose child span is on another component, or a span")
+    print("naming the component it calls when that one leaves no span (a database); its duration is the caller's")
+    print("span. Counts are scaled to the window length.\n")
     print(f"{'caller':9} -> {'callee':9} {'calls':>8} {'normal':>8}  {'mean ms':>9} {'normal':>9}")
     for caller, callee, now, normal, d_now, d_normal in con.execute(
-        """WITH s AS (SELECT trace_id, span_id, parent_id, cmdb_id, duration, ts >= ? AS win FROM trace
-                      WHERE (ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?))
-           SELECT p.cmdb_id, c.cmdb_id, count(*) FILTER (WHERE p.win), count(*) FILTER (WHERE NOT p.win) * ?,
-                  avg(p.duration) FILTER (WHERE p.win), avg(p.duration) FILTER (WHERE NOT p.win)
-           FROM s p JOIN s c ON c.trace_id = p.trace_id AND c.parent_id = p.span_id AND c.span_id <> c.parent_id
-           WHERE c.cmdb_id <> p.cmdb_id GROUP BY ALL ORDER BY 1, 2""",
+        """WITH s AS (SELECT trace_id, span_id, parent_id, cmdb_id, call_target, duration, ts >= ? AS win FROM trace
+                      WHERE (ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?)),
+                pairs AS (SELECT p.cmdb_id AS caller, c.cmdb_id AS callee, p.duration, p.win
+                          FROM s p JOIN s c ON c.trace_id = p.trace_id AND c.parent_id = p.span_id AND c.span_id <> c.parent_id
+                          WHERE c.cmdb_id <> p.cmdb_id
+                          UNION ALL
+                          SELECT cmdb_id, call_target, duration, win FROM s WHERE call_target IS NOT NULL)
+           SELECT caller, callee, count(*) FILTER (WHERE win), count(*) FILTER (WHERE NOT win) * ?,
+                  avg(duration) FILTER (WHERE win), avg(duration) FILTER (WHERE NOT win)
+           FROM pairs GROUP BY ALL ORDER BY 1, 2""",
         [case.start, case.start, case.end, ref_start, ref_end, scale],
     ).fetchall():
         print(f"{caller:9} -> {callee:9} {now:8d} {normal:8.0f}  {d_now or 0:9.1f} {d_normal or 0:9.1f}")
@@ -215,6 +228,9 @@ def onsets(con: duckdb.DuckDBPyConnection, case: Case, component: str, pattern: 
 
 
 def logs(con: duckdb.DuckDBPyConnection, case: Case, component: str, grep: str | None, samples: int) -> None:
+    if not has_view(con, "log"):
+        print(f"{case.system} has no logs.")
+        return
     pattern = f"%{grep}%" if grep else "%"
     print(f"Log lines of {component}{f' containing {grep!r}' if grep else ''} per minute:")
     rows = con.execute(
@@ -240,10 +256,7 @@ def logs(con: duckdb.DuckDBPyConnection, case: Case, component: str, grep: str |
 def submit(case: Case, answers_dir: Path, time: str, component: str, reason: str, append: bool,
            protocol: str = "hypotheses") -> None:
     datetime.strptime(time, TIME_FORMAT)
-    if component not in bank.COMPONENTS:
-        raise SystemExit(f"unknown component {component!r}; choose from {', '.join(bank.COMPONENTS)}")
-    if reason not in bank.REASONS:
-        raise SystemExit(f"unknown reason {reason!r}; choose from {'; '.join(bank.REASONS)}")
+    systems.get(case.system).check(component, reason)
     refused = protocol == "hypotheses" and hypotheses.check_answer(
         hypotheses.load(answers_dir.parent, case.case_id), component, reason)
     if refused:

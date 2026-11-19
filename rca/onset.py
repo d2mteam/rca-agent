@@ -127,10 +127,11 @@ def callers(con: duckdb.DuckDBPyConnection, case: Case, component: str) -> dict[
     """Components calling `component` in the window, directly or through others, with their distance."""
     direct: dict[str, set] = defaultdict(set)
     for caller, callee in con.execute(
-        """WITH s AS (SELECT trace_id, span_id, parent_id, cmdb_id FROM trace WHERE ts >= ? AND ts < ?)
+        """WITH s AS (SELECT trace_id, span_id, parent_id, cmdb_id, call_target FROM trace WHERE ts >= ? AND ts < ?)
            SELECT DISTINCT p.cmdb_id, c.cmdb_id FROM s p JOIN s c
            ON c.trace_id = p.trace_id AND c.parent_id = p.span_id AND c.span_id <> c.parent_id
-           WHERE c.cmdb_id <> p.cmdb_id""",
+           WHERE c.cmdb_id <> p.cmdb_id
+           UNION SELECT DISTINCT cmdb_id, call_target FROM s WHERE call_target IS NOT NULL""",
         [case.start, case.end],
     ).fetchall():
         direct[callee].add(caller)

@@ -56,7 +56,7 @@ Trace = tuple[list[str], list[str], list[str]]
 def _op(alias: str = "") -> str:
     """SQL naming a span's operation: its component and whether it is an outgoing call."""
     a = f"{alias}." if alias else ""
-    return f"{a}cmdb_id || CASE WHEN {a}span_id LIKE '369-%' THEN ':call' ELSE ':serve' END"
+    return f"{a}cmdb_id || CASE WHEN {a}is_call THEN ':call' ELSE ':serve' END"
 
 
 def coverage_tree(trace: Trace) -> tuple:
@@ -162,7 +162,9 @@ def partition(reference: list[tuple[float, Trace]], window: list[tuple[float, Tr
 
 
 def rank_components(con: duckdb.DuckDBPyConnection, case: Case) -> list[tuple[str, float]]:
-    sql = f"SELECT max(duration), list(span_id), list(parent_id), list({_op()}) FROM trace WHERE ts >= ? AND ts < ? GROUP BY trace_id"
+    # A span without a component (a few hundred a day on Telecom) names no operation and is left out.
+    sql = (f"SELECT max(duration), list(span_id), list(parent_id), list({_op()}) FROM trace "
+           "WHERE ts >= ? AND ts < ? AND cmdb_id IS NOT NULL GROUP BY trace_id")
     load = lambda start, end: [(latency, (s, p, o)) for latency, s, p, o in con.execute(sql, [start, end]).fetchall()]
     reference = load(case.start - 3600, case.start)
     if not reference:

@@ -10,7 +10,7 @@ The log holds no knowledge of the system: what to expect is the agent's own reas
 import json
 from pathlib import Path
 
-from rca import bank
+from rca import systems
 
 STATUSES = ("open", "supported", "refuted")
 
@@ -30,11 +30,9 @@ def _save(run_dir: Path, case_id: str, hypotheses: list[dict]) -> None:
     path.write_text(json.dumps(hypotheses, indent=1, ensure_ascii=False))
 
 
-def add(run_dir: Path, case_id: str, component: str, reason: str, if_true: str, if_false: str) -> dict:
-    if component not in bank.COMPONENTS:
-        raise SystemExit(f"unknown component {component!r}; choose from {', '.join(bank.COMPONENTS)}")
-    if reason not in bank.REASONS:
-        raise SystemExit(f"unknown reason {reason!r}; choose from {'; '.join(bank.REASONS)}")
+def add(run_dir: Path, case_id: str, component: str, reason: str, if_true: str, if_false: str,
+        system: str = "Bank") -> dict:
+    systems.get(system).check(component, reason)
     if not if_true.strip() or not if_false.strip():
         raise SystemExit("state what you expect to observe if the hypothesis is true and if it is false")
     hypotheses = load(run_dir, case_id)

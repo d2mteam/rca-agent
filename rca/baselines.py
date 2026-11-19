@@ -10,7 +10,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 
-from rca import bank
+from rca import systems
 from rca.cases import CST, Case
 from rca.scoring import FIELDS, TIME_FORMAT, Answer, expected_value, parse_official
 
@@ -25,11 +25,12 @@ def random_guess(cases: list[Case], seed: int = 0) -> dict[str, list[Answer]]:
     predictions = {}
     for c in cases:
         minutes = range(c.start, c.end, 60)
+        space = systems.get(c.system)
         predictions[c.case_id] = [
             Answer(
                 datetime.fromtimestamp(rng.choice(minutes), CST).strftime(TIME_FORMAT),
-                rng.choice(bank.COMPONENTS),
-                rng.choice(bank.REASONS),
+                rng.choice(space.components),
+                rng.choice(space.reasons),
             )
             for _ in c.faults
         ]

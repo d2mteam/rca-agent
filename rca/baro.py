@@ -26,14 +26,14 @@ import pandas as pd
 from baro.anomaly_detection import bocpd
 from baro.root_cause_analysis import preprocess
 
-from rca import bank
+from rca import systems
 from rca.cases import CST, Case
 from rca.scoring import TIME_FORMAT, Answer
 from rca.statistical import reason_for
 
 
-def minute_table(con: duckdb.DuckDBPyConnection, start: int, end: int) -> pd.DataFrame:
-    components = list(bank.COMPONENTS)
+def minute_table(con: duckdb.DuckDBPyConnection, start: int, end: int, components: tuple[str, ...]) -> pd.DataFrame:
+    components = list(components)
     marks = ", ".join("?" * len(components))
     long = con.execute(
         f"""
@@ -66,7 +66,7 @@ def rank_series(con: duckdb.DuckDBPyConnection, case: Case, two_sided: bool = Fa
     The score is BARO's max((x - median) / IQR) after the split, with an IQR of 0
     counting as 1; onset is the first row after the split scoring 3 or more.
     """
-    data = minute_table(con, case.start - 3600, case.end)
+    data = minute_table(con, case.start - 3600, case.end, systems.get(case.system).components)
     window_rows = [i for i, t in enumerate(data["time"]) if t >= case.start]
     # bocpd reports a change first seen in row i as i + 1, and always reports len(data).
     changed_rows = [i - 1 for i in bocpd(data) if i < len(data)]
@@ -94,7 +94,7 @@ def answer(con: duckdb.DuckDBPyConnection, case: Case) -> list[Answer]:
     for r in ranked:
         component, _, kpi = r.column.partition("|")
         reason = reason_for(kpi)
-        if component in bank.COMPONENTS and reason and component not in {c for c, _ in chosen}:
+        if reason and component not in {c for c, _ in chosen}:
             chosen.append((component, reason))
         if len(chosen) == len(case.faults):
             break

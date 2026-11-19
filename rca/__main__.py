@@ -7,13 +7,14 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from rca import bank, baselines, hypotheses, report, statistical, tools
+from rca import baselines, hypotheses, report, statistical, systems, tools
 from rca.cases import CST, Case, load_cases
 from rca.scoring import load_predictions, score_case, write_predictions
 from rca.telemetry import connect, prepare_day, window_counts
 
-# Days whose queries form the evaluation set; 2021_03_05 has no query and serves as the normal-day baseline.
-EVAL_DAYS = ["2021_03_09", "2021_03_25"]
+# Bank days whose queries form the evaluation set; 2021_03_05 has no query and serves as the normal-day
+# baseline. Other systems default to every day.
+EVAL_DAYS = {"Bank": ["2021_03_09", "2021_03_25"]}
 
 
 def _fmt(ts: int) -> str:
@@ -22,20 +23,26 @@ def _fmt(ts: int) -> str:
 
 def _cases(args: argparse.Namespace):
     cases = load_cases(args.data / "openrca" / args.system)
-    return [c for c in cases if c.day in args.days] if args.days else cases
+    days = args.days if args.days is not None else EVAL_DAYS.get(args.system)
+    return [c for c in cases if c.day in days] if days else cases
+
+
+def _connect(args: argparse.Namespace, system: str | None = None):
+    system = system or args.system
+    return connect(args.data / "parquet" / system, system=system)
 
 
 def cmd_prepare(args: argparse.Namespace) -> None:
     telemetry_dir = args.data / "openrca" / args.system / "telemetry"
     days = args.days or sorted(p.name for p in telemetry_dir.iterdir() if p.is_dir())
     for day in days:
-        counts = prepare_day(telemetry_dir, args.data / "parquet" / args.system, day)
+        counts = prepare_day(telemetry_dir, args.data / "parquet" / args.system, day, system=args.system)
         print(day, " ".join(f"{name}={n:,}" for name, n in counts.items()), flush=True)
 
 
 def cmd_cases(args: argparse.Namespace) -> None:
     cases = _cases(args)
-    con = connect(args.data / "parquet" / args.system) if args.counts else None
+    con = _connect(args) if args.counts else None
     for c in cases:
         faults = "; ".join(f"{_fmt(f.time)[6:]} {f.component} {f.reason}" for f in c.faults)
         line = f"{c.case_id} {c.task} asks={'+'.join(sorted(c.asks)):<22} window={_fmt(c.start)}-{_fmt(c.end)[6:]}  {faults}"
@@ -49,6 +56,8 @@ def cmd_cases(args: argparse.Namespace) -> None:
 def cmd_baseline(args: argparse.Namespace) -> None:
     cases = _cases(args)
     run_name = args.name
+    if args.system != "Bank" and args.name not in ("oracle", "random"):
+        raise SystemExit(f"{args.name} maps Bank KPI names to reasons; on {args.system} only oracle and random run")
     if args.name == "oracle":
         predictions = baselines.oracle(cases)
     elif args.name == "random":
@@ -60,11 +69,11 @@ def cmd_baseline(args: argparse.Namespace) -> None:
     elif args.name == "baro":
         from rca import baro  # optional dependency group "baro"
 
-        con = connect(args.data / "parquet" / args.system)
+        con = _connect(args)
         predictions = {c.case_id: baro.answer(con, c) for c in cases}
     else:
         run_name = f"{args.name}-{args.reference}"
-        con = connect(args.data / "parquet" / args.system)
+        con = _connect(args)
         predictions, top = {}, {}
         for c in cases:
             findings = statistical.rank_findings(con, c, args.name, args.reference)
@@ -91,7 +100,8 @@ def cmd_score(args: argparse.Namespace) -> None:
             print(f"{path}: no answer for {len(missing)} cases, scored 0: {' '.join(missing)}")
         runs[path.parent.name] = [score_case(c, predictions.get(c.case_id, [])) for c in cases]
 
-    print(f"{len(cases)} cases from {', '.join(args.days) if args.days else 'all days'}\n")
+    days = args.days if args.days is not None else EVAL_DAYS.get(args.system)
+    print(f"{len(cases)} cases from {', '.join(days) if days else 'all days'}\n")
     print(report.comparison(runs))
     if args.detail:
         for name, scores in runs.items():
@@ -101,7 +111,13 @@ def cmd_score(args: argparse.Namespace) -> None:
             print(report.case_lines(scores))
 
 
-def _normal_window(case_id: str, cases) -> Case | None:
+def _system_of(case_id: str, default: str) -> str:
+    """The system a case id names (telecom-023 is Telecom's), else the --system option."""
+    prefix = case_id.split("-", 1)[0]
+    return next((name for name in systems.SYSTEMS if name.lower() == prefix), default)
+
+
+def _normal_window(case_id: str, cases, system: str) -> Case | None:
     """normal-YYYY_MM_DD-HHMM: 30 minutes with no query, at least an hour away from every query window."""
     match = re.fullmatch(r"normal-(\d{4}_\d{2}_\d{2})-([01]\d|2[0-3])([0-5]\d)", case_id)
     if not match:
@@ -111,14 +127,18 @@ def _normal_window(case_id: str, cases) -> Case | None:
     end = start + 1800
     if any(start < c.end + 3600 and end > c.start - 3600 for c in cases):
         raise SystemExit(f"{case_id} lies within an hour of a query window; pick a normal window farther away")
-    return Case(case_id, "", "", frozenset(), start, end, ())
+    return Case(case_id, "", "", frozenset(), start, end, (), system)
 
 
 def cmd_tool(args: argparse.Namespace) -> None:
-    cases = load_cases(args.data / "openrca" / args.system)
-    case = _normal_window(args.case_id, cases) or next((c for c in cases if c.case_id == args.case_id), None)
+    system = _system_of(args.case_id, args.system)
+    cases = load_cases(args.data / "openrca" / system)
+    case = _normal_window(args.case_id, cases, system) or next((c for c in cases if c.case_id == args.case_id), None)
     if case is None:
         raise SystemExit(f"no case {args.case_id}")
+    component = getattr(args, "component", None)
+    if component is not None and args.tool not in ("hypothesis", "submit") and component not in systems.get(system).components:
+        raise SystemExit(f"unknown component {component!r}; choose from {', '.join(systems.get(system).components)}")
     if args.tool == "submit" and not case.faults:
         raise SystemExit(f"{args.case_id} is a normal window; there is nothing to submit")
     if args.tool == "submit":
@@ -128,13 +148,14 @@ def cmd_tool(args: argparse.Namespace) -> None:
     if args.tool == "hypothesis":
         run_dir = args.runs / args.run
         if args.action == "add":
-            entry = hypotheses.add(run_dir, case.case_id, args.component, args.reason, args.if_true, args.if_false)
+            entry = hypotheses.add(run_dir, case.case_id, args.component, args.reason, args.if_true, args.if_false,
+                                   system=case.system)
             print(f"hypothesis #{entry['id']} added")
         elif args.action == "test":
             hypotheses.test(run_dir, case.case_id, args.id, args.status, args.evidence)
         print(hypotheses.describe(hypotheses.load(run_dir, case.case_id)))
         return
-    con = connect(args.data / "parquet" / args.system)
+    con = _connect(args, system)
     if args.tool == "question":
         tools.question(con, case, args.protocol)
     elif args.tool == "overview":
@@ -175,14 +196,14 @@ def main() -> None:
     baseline.add_argument("name", choices=["oracle", "random", "openrca-agent", "zscore", "iqr", "baro"])
     baseline.add_argument("--reference", choices=["before", "normal-day"], default="before",
                           help="zscore/iqr: reference period for the normal level")
-    baseline.add_argument("--days", nargs="*", default=EVAL_DAYS)
+    baseline.add_argument("--days", nargs="*", help="default: Bank's evaluation days, every day elsewhere")
     baseline.add_argument("--seed", type=int, default=0)
     baseline.add_argument("--archive", type=Path, help="OpenRCA rca/archive/agent-Bank.csv")
     baseline.set_defaults(func=cmd_baseline)
 
     score = sub.add_parser("score", help="score answer files the way OpenRCA does")
     score.add_argument("predictions", nargs="+", type=Path, help="runs/<name>/predictions.jsonl")
-    score.add_argument("--days", nargs="*", default=EVAL_DAYS)
+    score.add_argument("--days", nargs="*", help="default: Bank's evaluation days, every day elsewhere")
     score.add_argument("--cases", nargs="*", help="only these case ids, e.g. bank-024")
     score.add_argument("--detail", action="store_true", help="add per-reason and per-case breakdowns")
     score.set_defaults(func=cmd_score)
@@ -196,20 +217,20 @@ def main() -> None:
         kinds.add_parser(name).add_argument("case_id")
     p = kinds.add_parser("baro")
     p.add_argument("case_id")
-    p.add_argument("--component", choices=bank.COMPONENTS)
+    p.add_argument("--component")
     p.add_argument("--top", type=int, default=20)
     p = kinds.add_parser("onset")
     p.add_argument("case_id")
-    p.add_argument("component", choices=bank.COMPONENTS)
+    p.add_argument("component")
     p.add_argument("--pattern", help="only series whose name contains this text")
     p.add_argument("--top", type=int, default=25)
     p = kinds.add_parser("series")
     p.add_argument("case_id")
-    p.add_argument("component", choices=bank.COMPONENTS)
+    p.add_argument("component")
     p.add_argument("kpi", help="substring of the KPI name; \"\" lists every KPI")
     p = kinds.add_parser("logs")
     p.add_argument("case_id")
-    p.add_argument("component", choices=bank.COMPONENTS)
+    p.add_argument("component")
     p.add_argument("--grep", help="only lines containing this text")
     p.add_argument("--samples", type=int, default=10)
     p = kinds.add_parser("hypothesis")

@@ -20,14 +20,13 @@ from datetime import datetime
 
 import duckdb
 
-from rca import bank
+from rca import systems
 from rca.cases import CST, Case
 from rca.scoring import TIME_FORMAT, Answer
 
 THRESHOLD = 3.0
-NORMAL_DAY = datetime(2021, 3, 5, tzinfo=CST)
 
-# KPI name -> reason, first match wins. Unlisted KPIs (MySQL, Redis, Tomcat
+# Bank KPI name -> reason, first match wins. Unlisted KPIs (MySQL, Redis, Tomcat
 # request/session/thread counters, swap, processes...) are ignored.
 REASON_RULES = (
     (re.compile(r"JVM_JVM_CPULoad$"), "high JVM CPU load"),
@@ -62,7 +61,10 @@ def reason_for(kpi: str) -> str | None:
 def reference_period(case: Case, reference: str) -> tuple[int, int]:
     if reference == "before":
         return case.start - 3600, case.start
-    days_back = (datetime.fromtimestamp(case.start, CST).date() - NORMAL_DAY.date()).days
+    normal_day = systems.get(case.system).normal_day
+    if normal_day is None:
+        raise SystemExit(f"{case.system} has no normal day; use the hour before")
+    days_back = (datetime.fromtimestamp(case.start, CST).date() - normal_day).days
     shift = days_back * 86400
     return case.start - shift - 1800, case.end - shift + 1800
 
@@ -70,7 +72,7 @@ def reference_period(case: Case, reference: str) -> tuple[int, int]:
 def rank_findings(con: duckdb.DuckDBPyConnection, case: Case, method: str, reference: str) -> list[Finding]:
     """Every scorable series of the window, highest score first."""
     ref_start, ref_end = reference_period(case, reference)
-    components = list(bank.COMPONENTS)
+    components = list(systems.get(case.system).components)
     marks = ", ".join("?" * len(components))
     rows = con.execute(
         f"""

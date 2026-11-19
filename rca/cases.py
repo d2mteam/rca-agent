@@ -36,6 +36,7 @@ class Case:
     start: int
     end: int
     faults: tuple[Fault, ...]
+    system: str = "Bank"  # OpenRCA system the case belongs to
 
     @property
     def day(self) -> str:
@@ -119,6 +120,7 @@ def load_cases(system_dir: Path) -> list[Case]:
                 start=start,
                 end=end,
                 faults=tuple(faults),
+                system=system_dir.name,
             )
         )
     return cases

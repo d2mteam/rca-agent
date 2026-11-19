@@ -1,6 +1,6 @@
 import duckdb
 
-from rca import onset
+from rca import onset, telemetry
 from rca.cases import Case
 
 START = 1_615_266_000
@@ -41,8 +41,9 @@ def test_baseline_sitting_on_zero_uses_percentile_levels():
 
 def test_callers_are_found_transitively_with_their_distance():
     con = duckdb.connect()
-    con.execute("CREATE TABLE trace (ts DOUBLE, cmdb_id VARCHAR, parent_id VARCHAR, span_id VARCHAR, trace_id VARCHAR, duration BIGINT)")
-    con.executemany("INSERT INTO trace VALUES (?, ?, ?, ?, ?, ?)", [
+    con.execute("CREATE TABLE raw (ts DOUBLE, cmdb_id VARCHAR, parent_id VARCHAR, span_id VARCHAR, trace_id VARCHAR, duration BIGINT)")
+    con.execute(f"CREATE VIEW trace AS SELECT {telemetry.VIEW_COLUMNS['Bank']['trace']} FROM raw")
+    con.executemany("INSERT INTO raw VALUES (?, ?, ?, ?, ?, ?)", [
         (START + 5, "IG01", "r", "r", "t", 30),
         (START + 5, "Tomcat01", "r", "s1", "t", 20),
         (START + 5, "MG01", "s1", "s2", "t", 10),
