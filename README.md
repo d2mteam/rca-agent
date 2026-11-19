@@ -383,9 +383,66 @@ mỗi lệnh một nguyên nhân. Đáp án được ghi vào `runs/<run>/predic
 
 ## 2. Pipeline: từ dữ liệu tới đáp án
 
-Phần này bắt đầu bằng một phiên làm việc thật của agent trên một câu hỏi, để thấy
-toàn bộ quá trình trước khi đi vào chi tiết. Sau đó mới giải thích dữ liệu được
-chuẩn bị ra sao, và từng công cụ nhận vào gì, làm gì, trả ra gì.
+Phần này có ba bước. Mục 2.0 vẽ toàn bộ pipeline. Mục 2.1 là một phiên làm việc
+thật của agent trên một câu hỏi. Các mục sau giải thích dữ liệu được chuẩn bị ra
+sao, và từng công cụ nhận vào gì, làm gì, trả ra gì.
+
+### 2.0 Tổng quan pipeline
+
+Pipeline có bốn giai đoạn. Hai giai đoạn đầu chỉ làm một lần cho mỗi hệ thống. Giai
+đoạn 3 lặp lại cho từng câu hỏi. Giai đoạn 4 là việc của người phát triển, giữa các
+lần chạy.
+
+```text
+1. CHUẨN BỊ DỮ LIỆU (một lần)
+│  CSV của OpenRCA (metric, log, trace theo ngày)
+│     ──python -m rca prepare──> Parquet: 4 bảng chung cho mọi hệ
+│                                metric_app, metric_container, trace, log
+▼
+2. VIẾT HỒ SƠ HỆ THỐNG (một lần)
+│  một agent chạy các công cụ trên 6 cửa sổ khỏe (normal-YYYY_MM_DD-HHMM)
+│     ──> profiles/<hệ>.md: ai gọi ai, mức bình thường, công cụ báo gì khi không lỗi
+▼
+3. GIẢI CÂU HỎI (lặp cho từng câu)
+│  agent đọc hồ sơ, chạy  tool question <câu>  → đề bài, 30 phút, danh sách đáp án
+│
+│  ┌─► agent chọn một công cụ
+│  │      công cụ đọc Parquet (30 phút + giờ trước đó), so sánh, chấm điểm
+│  │      → in một bảng chữ ngắn
+│  │   agent đọc bảng, nêu hoặc kiểm giả thuyết (hypothesis add / test)
+│  └── lặp lại, khoảng 15–25 lệnh mỗi câu
+│
+│  submit: chỉ nhận nếu có 1 giả thuyết được ủng hộ và 1 giả thuyết khác bị bác
+│     ──> runs/<run>/answers/<câu>.json, runs/<run>/predictions.jsonl
+▼
+4. CHẤM ĐIỂM VÀ CẢI TIẾN (người phát triển)
+   python -m rca score: so đáp án với record.csv theo luật OpenRCA → điểm
+   soát lại các lệnh agent đã chạy (không được đọc đáp án hay mã nguồn)
+   xem các câu sai → sửa công cụ hoặc hồ sơ → chạy lại, chấm trên các câu chưa dùng
+```
+
+| Giai đoạn | Nhận vào | Trả ra | Mã nguồn |
+|---|---|---|---|
+| 1. Chuẩn bị dữ liệu | CSV mỗi ngày | Parquet theo ngày; 4 bảng chung | [rca/telemetry.py](rca/telemetry.py) |
+| 2. Hồ sơ hệ thống | các cửa sổ khỏe | `profiles/<hệ>.md` | do agent viết; cửa sổ khỏe mở bằng [rca/__main__.py](rca/__main__.py) |
+| 3a. Đọc câu hỏi | `query.csv` | khoảng 30 phút, các trường được hỏi | [rca/cases.py](rca/cases.py) |
+| 3b. Công cụ | Parquet của khoảng thời gian đó | bảng chữ ngắn | [rca/tools.py](rca/tools.py), [rca/baro.py](rca/baro.py), [rca/exclusive_time.py](rca/exclusive_time.py), [rca/microrank.py](rca/microrank.py), [rca/onset.py](rca/onset.py) |
+| 3c. Giả thuyết, nộp đáp án | lệnh của agent | `hypotheses/<câu>.json`, `answers/<câu>.json`, `predictions.jsonl` | [rca/hypotheses.py](rca/hypotheses.py), [rca/tools.py](rca/tools.py) |
+| 4. Chấm điểm | `predictions.jsonl`, `query.csv`, `record.csv` | điểm từng câu, tổng hợp | [rca/scoring.py](rca/scoring.py), [rca/report.py](rca/report.py) |
+
+Mấy điều cần biết về cách các giai đoạn nối với nhau:
+
+- **Agent chỉ chạm vào dữ liệu qua công cụ.** Nó không bao giờ đọc thẳng Parquet,
+  CSV hay `record.csv`. Bước chấm điểm thì đọc `record.csv`, nhưng chạy riêng, sau
+  khi agent đã nộp đáp án.
+- **Điểm số không quay lại agent.** Agent không biết mình đúng hay sai. Thông tin
+  chảy ngược duy nhất là ở giai đoạn 4: người phát triển sửa công cụ hoặc hồ sơ.
+- **Song song ở mức agent.** Mỗi agent giải một lô khoảng 10 câu, và có thể chạy
+  vài agent cùng lúc. Mỗi agent ghi vào thư mục run riêng. Bên trong một agent, các
+  lệnh chạy lần lượt, và mỗi lệnh là một chương trình chạy xong rồi thoát.
+- **Phương pháp so sánh đi đường tắt.** `python -m rca baseline zscore` (hoặc
+  `random`, `baro`) bỏ qua giai đoạn 2 và 3. Code tự đưa ra đáp án, ghi vào
+  `predictions.jsonl` theo đúng định dạng của agent, rồi được chấm cùng một cách.
 
 ### 2.1 Một phiên làm việc thật của agent
 
