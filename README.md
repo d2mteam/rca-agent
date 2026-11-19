@@ -389,80 +389,26 @@ sao, và từng công cụ nhận vào gì, làm gì, trả ra gì.
 
 ### 2.0 Tổng quan pipeline
 
-Pipeline có bốn giai đoạn. Hai giai đoạn đầu chỉ làm một lần cho mỗi hệ thống. Giai
-đoạn 3 lặp lại cho từng câu hỏi. Giai đoạn 4 là việc của người phát triển, giữa các
-lần chạy.
-
 ```mermaid
-flowchart TD
-    subgraph S1["1. Chuẩn bị dữ liệu (một lần)"]
-        CSV["CSV của OpenRCA<br/>metric, log, trace theo ngày"]
-        PQ[("Parquet: 4 bảng chung<br/>metric_app, metric_container,<br/>trace, log")]
-        CSV -- "python -m rca prepare" --> PQ
-    end
-
-    subgraph S2["2. Viết hồ sơ hệ thống (một lần)"]
-        NW["6 cửa sổ khỏe<br/>normal-YYYY_MM_DD-HHMM"]
-        PA["Agent khảo sát<br/>bằng các công cụ"]
-        PF["profiles/bank.md, telecom.md<br/>ai gọi ai, mức bình thường,<br/>nhiễu thường gặp"]
-        NW --> PA --> PF
-    end
-
-    subgraph S3["3. Giải một câu hỏi (lặp cho từng câu)"]
-        Q["tool question<br/>đề bài, 30 phút, danh sách đáp án"]
-        A{"Agent LLM<br/>suy luận"}
-        T["Công cụ: overview, calls, series, logs,<br/>baro, exclusive, traces, onset"]
-        OUT["Bảng chữ ngắn"]
-        H["Sổ giả thuyết<br/>hypothesis add / test"]
-        SUB["submit<br/>chỉ nhận khi 1 giả thuyết được ủng hộ<br/>và 1 giả thuyết khác bị bác"]
-        Q --> A
-        A -- "chọn công cụ" --> T
-        T --> OUT
-        OUT -- "đọc kết quả" --> A
-        A <--> H
-        A -- "đủ bằng chứng" --> SUB
-    end
-
-    subgraph S4["4. Chấm điểm và cải tiến (người phát triển)"]
-        PRED["runs/tên-run/predictions.jsonl"]
-        SC["python -m rca score<br/>luật OpenRCA"]
-        REC["record.csv<br/>đáp án đúng"]
-        FIX["Xem câu sai,<br/>sửa công cụ hoặc hồ sơ"]
-        PRED --> SC
-        REC --> SC
-        SC --> FIX
-    end
-
-    PQ --> PA
-    PQ --> T
-    PF --> A
-    SUB --> PRED
-    FIX -. "chạy lại trên câu chưa dùng" .-> T
-    FIX -.-> PF
+flowchart LR
+    D["Dữ liệu giám sát<br/>metric, log, trace"] --> N["Chuẩn hóa"]
+    N --> T["Công cụ phân tích"]
+    Q["Câu hỏi"] --> A(["Agent LLM"])
+    P["Hồ sơ hệ thống<br/>lúc bình thường"] --> A
+    A -- "gọi công cụ" --> T
+    T -- "bảng kết quả" --> A
+    A <--> H["Giả thuyết<br/>và kiểm chứng"]
+    A --> R["Đáp án"]
+    R --> S["Chấm điểm"]
 ```
 
-| Giai đoạn | Nhận vào | Trả ra | Mã nguồn |
-|---|---|---|---|
-| 1. Chuẩn bị dữ liệu | CSV mỗi ngày | Parquet theo ngày; 4 bảng chung | [rca/telemetry.py](rca/telemetry.py) |
-| 2. Hồ sơ hệ thống | các cửa sổ khỏe | `profiles/<hệ>.md` | do agent viết; cửa sổ khỏe mở bằng [rca/__main__.py](rca/__main__.py) |
-| 3a. Đọc câu hỏi | `query.csv` | khoảng 30 phút, các trường được hỏi | [rca/cases.py](rca/cases.py) |
-| 3b. Công cụ | Parquet của khoảng thời gian đó | bảng chữ ngắn | [rca/tools.py](rca/tools.py), [rca/baro.py](rca/baro.py), [rca/exclusive_time.py](rca/exclusive_time.py), [rca/microrank.py](rca/microrank.py), [rca/onset.py](rca/onset.py) |
-| 3c. Giả thuyết, nộp đáp án | lệnh của agent | `hypotheses/<câu>.json`, `answers/<câu>.json`, `predictions.jsonl` | [rca/hypotheses.py](rca/hypotheses.py), [rca/tools.py](rca/tools.py) |
-| 4. Chấm điểm | `predictions.jsonl`, `query.csv`, `record.csv` | điểm từng câu, tổng hợp | [rca/scoring.py](rca/scoring.py), [rca/report.py](rca/report.py) |
+1. Dữ liệu giám sát được chuẩn hóa một lần.
+2. Với mỗi câu hỏi, agent đọc hồ sơ hệ thống, rồi lặp lại: gọi công cụ, đọc bảng
+   kết quả, nêu và kiểm giả thuyết.
+3. Khi đủ bằng chứng, agent nộp đáp án, và đáp án được chấm theo luật OpenRCA.
 
-Mấy điều cần biết về cách các giai đoạn nối với nhau:
-
-- **Agent chỉ chạm vào dữ liệu qua công cụ.** Nó không bao giờ đọc thẳng Parquet,
-  CSV hay `record.csv`. Bước chấm điểm thì đọc `record.csv`, nhưng chạy riêng, sau
-  khi agent đã nộp đáp án.
-- **Điểm số không quay lại agent.** Agent không biết mình đúng hay sai. Thông tin
-  chảy ngược duy nhất là ở giai đoạn 4: người phát triển sửa công cụ hoặc hồ sơ.
-- **Song song ở mức agent.** Mỗi agent giải một lô khoảng 10 câu, và có thể chạy
-  vài agent cùng lúc. Mỗi agent ghi vào thư mục run riêng. Bên trong một agent, các
-  lệnh chạy lần lượt, và mỗi lệnh là một chương trình chạy xong rồi thoát.
-- **Phương pháp so sánh đi đường tắt.** `python -m rca baseline zscore` (hoặc
-  `random`, `baro`) bỏ qua giai đoạn 2 và 3. Code tự đưa ra đáp án, ghi vào
-  `predictions.jsonl` theo đúng định dạng của agent, rồi được chấm cùng một cách.
+Agent chỉ tiếp xúc với dữ liệu qua các công cụ, và không bao giờ biết điểm của
+mình. Chi tiết từng bước nằm ở các mục dưới.
 
 ### 2.1 Một phiên làm việc thật của agent
 
