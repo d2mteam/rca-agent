@@ -714,7 +714,7 @@ cả giá trị thật, không chỉ nhìn điểm.
 
 ### 2.5 Từng công cụ
 
-Mọi ví dụ đầu ra dưới đây lấy từ câu hỏi bank-114 ở mục 2.1.
+Mọi ví dụ đầu ra dưới đây lấy từ câu hỏi bank-114 ở mục 2.1. Nếu thấy khó hiểu các thuật toán BARO, exclusive time, MicroRank và onset, hãy đọc chương 3 trước.
 
 #### `question <câu hỏi>`: đề bài là gì?
 
@@ -979,11 +979,190 @@ thống; chúng không được viết thành luật trong code.
 Hồ sơ hệ thống giúp loại những dao động trông đáng ngờ nhưng vẫn xảy ra lúc bình
 thường, ví dụ các đợt đọc đĩa ngắn.
 
-## 3. Tình hình hiện tại
+## 3. Các thuật toán, giải thích cho người mới
+
+Chương này giải thích ý tưởng của bốn thuật toán mà các công cụ dùng: exclusive
+time, BARO, MicroRank (dựa trên PageRank) và onset. Không cần biết toán; mỗi thuật
+toán có một ví dụ nhỏ có thể tự tính tay.
+
+### 3.1 Exclusive time: ai thật sự chậm?
+
+**Vấn đề.** Một request đi qua nhiều máy theo kiểu gọi nối tiếp: IG gọi Tomcat,
+Tomcat gọi MG. Máy gọi phải ngồi chờ máy được gọi trả lời. Vì vậy, khi MG chậm thì
+Tomcat và IG cũng chậm theo. Nhìn thời gian của từng máy, cả ba đều "có vấn đề".
+
+**Ý tưởng.** Với mỗi máy, chỉ giữ phần thời gian nó **tự làm việc**, bỏ phần ngồi
+chờ máy khác. Phần thời gian còn lại được chia làm hai loại:
+
+- **processing:** thời gian máy tự xử lý;
+- **network in:** thời gian từ lúc máy gọi gửi đi đến lúc máy được gọi bắt đầu
+  xử lý, tức là trên đường mạng và trong hàng đợi.
+
+**Ví dụ.** Lúc bình thường, một request mất các khoảng thời gian sau:
+
+| Đo được trong trace | Bình thường | Khi MG tự chậm thêm 500 ms | Khi mạng vào Tomcat chậm thêm 300 ms |
+|---|---:|---:|---:|
+| IG gọi Tomcat, tính cả lúc chờ | 120 | 620 | 420 |
+| Tomcat xử lý, tính cả lúc chờ MG | 100 | 600 | 100 |
+| Tomcat gọi MG, tính cả lúc chờ | 70 | 570 | 70 |
+| MG xử lý | 60 | 560 | 60 |
+
+Ở cột giữa, mọi con số đều tăng 500 ms, nên không biết máy nào gây ra. Tính
+exclusive time bằng cách lấy mỗi khoảng trừ đi khoảng nằm ngay bên trong nó:
+
+| Exclusive time | Bình thường | Khi MG tự chậm | Khi mạng vào Tomcat chậm |
+|---|---:|---:|---:|
+| network in của Tomcat = 120 − 100 | 20 | 20 | **320** |
+| processing của Tomcat = 100 − 70 | 30 | 30 | 30 |
+| network in của MG = 70 − 60 | 10 | 10 | 10 |
+| processing của MG = 60 | 60 | **560** | 60 |
+
+Mỗi tình huống chỉ còn đúng một con số thay đổi, và nó chỉ thẳng vào chỗ gây lỗi.
+
+**Giới hạn.**
+- Chỉ áp dụng cho máy có trace. Ở Bank, apache, Mysql và Redis không có trace.
+- Một lời gọi bị mất hoặc timeout không để lại khoảng thời gian ở máy được gọi, nên
+  bị bỏ qua.
+- Phép trừ chỉ đúng khi máy gọi các máy khác lần lượt, không gọi song song. Trace
+  của Bank gần như luôn như vậy.
+
+### 3.2 BARO: lúc nào hệ thống đổi trạng thái, và chỉ số nào đổi nhiều nhất?
+
+BARO làm hai bước.
+
+**Bước 1: tìm thời điểm thay đổi (BOCPD).** Hãy hình dung đọc một chuỗi số từ đầu
+đến cuối, ví dụ thời gian phản hồi mỗi phút:
+
+```text
+500  520  490  510  505  2100  9000  5800
+```
+
+Sau mỗi số, ta tự hỏi: "giai đoạn hiện tại đã kéo dài bao lâu rồi?". Với 4 số đầu,
+câu trả lời là "giai đoạn này vẫn đang tiếp diễn", vì các số giống nhau. Đến 2100,
+số mới khác hẳn mọi số trước, nên khả năng "một giai đoạn mới vừa bắt đầu" tăng vọt.
+Đó là **điểm thay đổi**. BOCPD (Bayesian Online Change Point Detection) làm đúng
+việc này bằng xác suất, trên nhiều chuỗi cùng lúc. BARO chỉ chạy nó trên thời gian
+phản hồi và tỉ lệ lỗi của các service.
+
+**Bước 2: chấm điểm từng chỉ số.** Điểm thay đổi chia dữ liệu làm hai phần: trước là
+bình thường, sau là bất thường. Mỗi chỉ số được chấm:
+
+```text
+điểm = (giá trị sau điểm thay đổi − trung vị trước đó) / IQR trước đó
+```
+
+Ví dụ: trước điểm thay đổi, CPU của một máy dao động trong khoảng 26–28%, với trung vị
+27 và IQR 1. Sau điểm thay đổi, CPU lần lượt là 27, 60, 80. Điểm của từng phút là 0,
+33 và 53. Chỉ số này được 53 điểm. Nó bắt đầu lệch (điểm từ 3 trở lên) ở phút có giá
+trị 60.
+
+BARO dùng trung vị và IQR chứ không dùng trung bình và độ lệch chuẩn. Lý do là một
+vài gai đột biến lúc bình thường không làm lệch hai con số này.
+
+**Giới hạn.**
+- Nếu bước 1 không tìm được điểm thay đổi, BARO lấy đầu khoảng 30 phút làm mốc, và
+  mọi kết quả đều tính từ mốc đó.
+- Chuỗi gần như hằng số có IQR rất nhỏ, nên chỉ đổi một chút cũng được điểm khổng lồ.
+  Ví dụ trong hồ sơ hệ thống: một chuỗi đổi từ 58,09 triệu lên 58,13 triệu byte mà
+  được 33 760 điểm.
+- Mỗi phút được chấm riêng, nên một gai một phút có thể được điểm cao bằng một sự cố
+  kéo dài.
+
+### 3.3 PageRank và MicroRank: máy nào hay có mặt trong các request bất thường?
+
+**PageRank là gì.** Đây là thuật toán Google từng dùng để xếp hạng trang web. Hãy
+tưởng tượng một người lướt web ngẫu nhiên: ở mỗi trang, họ bấm ngẫu nhiên một link
+để sang trang khác. Thỉnh thoảng (15% số lần), họ bỏ link và nhảy sang một trang bất
+kỳ. Sau rất lâu, trang nào người đó ghé nhiều nhất là trang quan trọng nhất. Một
+trang quan trọng khi có nhiều trang quan trọng khác trỏ tới nó.
+
+**PageRank cá nhân hóa.** Thay vì nhảy sang một trang bất kỳ, người đó luôn nhảy về
+một số **trang xuất phát** chọn trước. Khi đó, điểm của một trang cho biết nó gần
+và liên quan tới các trang xuất phát đến mức nào.
+
+**MicroRank áp dụng vào RCA như sau:**
+
+1. Chia các request trong 30 phút làm hai nhóm. Bất thường là các request chậm hơn
+   99% request cùng kiểu lúc bình thường, hoặc có một lời gọi bị mất. Còn lại là bình
+   thường.
+2. Dựng một đồ thị. Mỗi request nối với các bước nó đi qua, ví dụ "Tomcat02 tự xử lý"
+   hay "Tomcat02 gọi đi". Mỗi bước nối với các bước nó gọi.
+3. Chạy PageRank cá nhân hóa, với trang xuất phát là các request trong nhóm. Chạy
+   một lần cho nhóm bất thường và một lần cho nhóm bình thường. Kết quả: mỗi bước có
+   một điểm "bất thường" và một điểm "bình thường".
+
+   Không phải request nào cũng được làm điểm xuất phát với trọng số như nhau. Ở nhóm
+   bất thường, request đi qua ít bước và request thuộc kiểu hiếm được ưu tiên, vì
+   chúng chỉ ra chỗ lỗi rõ hơn. Ở nhóm bình thường, chỉ kiểu hiếm được ưu tiên.
+4. Gộp hai điểm bằng công thức Ochiai (bên dưới). Điểm của một máy là điểm cao nhất
+   trong các bước của nó.
+
+**Công thức Ochiai.** Công thức này mượn từ việc dò lỗi phần mềm: dòng code nào chạy
+trong nhiều bài test hỏng mà ít chạy trong bài test qua, thì đáng nghi. Ở đây thay
+"bài test" bằng request:
+
+```text
+Ochiai = (số request bất thường có máy đó)
+         / √[(số request có máy đó) × (tổng số request bất thường)]
+```
+
+Ví dụ, có 100 request bất thường và 1 000 request bình thường:
+
+| Máy | Có mặt trong request bất thường | Có mặt trong request bình thường | Ochiai |
+|---|---:|---:|---:|
+| Tomcat02 | 90 | 250 | 90 / √(340 × 100) = **0,49** |
+| IG01 (mọi request đều đi qua) | 100 | 1 000 | 100 / √(1 100 × 100) = 0,30 |
+| Tomcat01 | 5 | 250 | 5 / √(255 × 100) = 0,03 |
+
+IG01 có mặt trong mọi request bất thường, nhưng cũng có mặt trong mọi request bình
+thường, nên điểm của nó thấp hơn Tomcat02. MicroRank làm đúng phép tính này, chỉ khác
+là mỗi lần đếm được nhân với điểm PageRank ở bước 3.
+
+**Giới hạn.**
+- Chỉ xếp hạng các máy có trace.
+- Luôn xếp hạng một máy nào đó, kể cả khi không có lỗi. Lúc hệ khỏe, máy đứng đầu
+  thường được 0,04–0,46 điểm.
+- Ở bank-114, máy gây lỗi (Tomcat02) không lọt vào 8 máy đầu.
+
+### 3.4 Onset: máy này bất thường trước hay sau các máy gọi nó?
+
+**Ý tưởng.** Lỗi lan giống domino: máy gây lỗi đổ trước, rồi tới các máy gọi nó. Vì
+vậy, để kiểm giả thuyết "máy X gây lỗi", hãy xem X có bất thường **trước** các máy
+gọi tới X hay không. Nếu một máy gọi X bất thường sớm hơn X, giả thuyết có vấn đề.
+
+**Cách tìm thời điểm bắt đầu bất thường của một chuỗi số:**
+
+1. Với mỗi giá trị, so với 15 giá trị ngay trước nó (gọi là nền), rồi xếp vào một
+   trong bốn mức: bình thường, moderate (hơi cao), warning (cao), critical (rất cao).
+   - Nếu nền dao động bình thường, dùng z-score. Lệch hơn 1,5 độ lệch chuẩn là
+     moderate, hơn 2 là warning, hơn 3 là critical.
+   - Nếu nền gần như luôn một giá trị (ví dụ số lỗi luôn bằng 0), độ lệch chuẩn bằng
+     0 và z-score vô nghĩa. Khi đó dùng ngưỡng theo phân vị của nền.
+2. Một lần bất thường là **ít nhất 2 giá trị liên tiếp** từ mức warning trở lên. Một
+   giá trị cao lẻ loi không được tính.
+3. Thời điểm bắt đầu được lùi về các giá trị moderate nằm ngay trước, vì đó thường
+   là lúc sự cố đã bắt đầu nhưng chưa rõ.
+
+Ví dụ: CPU của một máy ổn định quanh 27%. Lúc 16:21 lên 30 (moderate), 16:22 lên
+60 (critical), 16:23 lên 80 (critical). Lần bất thường bắt đầu ở 16:22, rồi lùi về
+16:21.
+
+Sau đó công cụ làm như vậy với các máy gọi X (lấy từ trace), trên thời gian xử lý của
+chúng. Máy gọi nào bất thường sớm hơn X quá 60 giây sẽ bị đánh dấu.
+
+**Giới hạn.**
+- Dữ liệu tính theo phút, nên hai máy lệch trong cùng một phút thì không phân biệt
+  được trước sau.
+- Một chuỗi trôi lên từ từ có thể không bao giờ vượt ngưỡng, so với nền 15 phút vốn
+  cũng đang trôi.
+- Không dùng để dò lỗi: quét mọi chuỗi của mọi máy theo cách này thì kết quả bị lấn
+  át bởi nhiễu. Công cụ chỉ dùng để kiểm một máy đã bị nghi.
+
+## 4. Tình hình hiện tại
 
 Số liệu trong phần này tính đến ngày 2026-11-19.
 
-### 3.1 Kết quả
+### 4.1 Kết quả
 
 **Câu nào dùng để đánh giá.** Trong lúc phát triển, nhóm đã xem đáp án của 40 câu
 hỏi thuộc hai ngày 9/3 và 25/3 để sửa công cụ. Nếu chấm trên chính 40 câu này, kết
@@ -1041,7 +1220,7 @@ hình có thể dao động khoảng 3 câu trên 30.
 bài báo chấm trên cả ba hệ thống với 335 câu, còn ở đây là 96 câu của Bank, với
 cách làm khác.
 
-### 3.2 Những vấn đề đã gặp và cách khắc phục
+### 4.2 Những vấn đề đã gặp và cách khắc phục
 
 **Lịch sử ngắn.** Repo này ban đầu là một công cụ phê duyệt thay đổi hạ tầng, có
 người duyệt (human-in-the-loop); vì vậy thư mục vẫn tên là `human-in-the-loop-infra`.
@@ -1085,7 +1264,7 @@ repo chuyển sang bài toán RCA trên OpenRCA.
 | Một lần chạy không đủ để tin. Mỗi agent giải cả một lô câu, và có xu hướng áp một cách hiểu cho cả lô; ví dụ, cả lô nghiêng về "network latency" thay vì "network packet loss". Nhờ vậy, sai lệch giữa các lần chạy lớn hơn ta tưởng. | Chạy lại cùng cấu hình nhiều lần trên cùng các câu, và báo kết quả của từng lần. |
 | Agent có thể đọc trộm dữ liệu đáp án hoặc mã nguồn. | Lời dặn cấm rõ, và sau mỗi lần chạy đều soát lại toàn bộ lệnh agent đã chạy. Chưa phát hiện vi phạm nào. |
 
-### 3.3 Những lỗi agent vẫn còn mắc
+### 4.3 Những lỗi agent vẫn còn mắc
 
 Phân loại các câu agent làm sai trong 96 câu của Bank. Một câu có thể thuộc nhiều
 loại.
@@ -1102,7 +1281,7 @@ loại.
 (telecom-027, 028, 031). Agent chỉ thấy triệu chứng ở các docker, nhưng dữ liệu
 không cho biết docker nào chạy trên máy os nào.
 
-### 3.4 Các việc còn mở
+### 4.4 Các việc còn mở
 
 - **Tách trễ mạng với mất gói.** Có thể thêm vào `calls` phân phối thời lượng
   (không chỉ trung bình) và tỉ lệ lời gọi thất bại.
