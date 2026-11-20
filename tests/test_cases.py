@@ -88,3 +88,22 @@ def test_load_cases_rejects_points_with_no_record_in_window(tmp_path):
     points = "The only predicted root cause component is Mysql02\n"
     with pytest.raises(ValueError, match="query 1: 0 records"):
         load_cases(_system(tmp_path, "On March 4, 2021, between 18:00 and 18:30, one failure ...", points))
+
+
+def test_load_cases_gives_faults_that_grade_alike_distinct_records(tmp_path):
+    # Market: two failures with the same reason, only the reason asked.
+    system = tmp_path / "Bank"
+    system.mkdir()
+    with open(system / "query.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["task_index", "instruction", "scoring_points"])
+        writer.writerow(["task_2", "On March 20, 2022, from 08:30 to 09:00, two failures ...",
+                         "The 1-th predicted root cause reason is container network latency\n"
+                         "The 2-th predicted root cause reason is container network latency\n"])
+    with open(system / "record.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["level", "component", "timestamp", "datetime", "reason"])
+        writer.writerow(["service", "adservice", "1647737329", "2022-03-20 08:48:49", "container network latency"])
+        writer.writerow(["service", "cartservice", "1647736751", "2022-03-20 08:39:11", "container network latency"])
+    [case] = load_cases(system)
+    assert [f.component for f in case.faults] == ["cartservice", "adservice"]

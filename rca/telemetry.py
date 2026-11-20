@@ -27,6 +27,8 @@ class Source:
     columns: dict[str, str]
     select: str = "* EXCLUDE (timestamp)"  # columns kept after ts
     timestamp: str = "timestamp"
+    filename: bool = False  # expose the CSV path of each row as `filename` to `select`
+    derive: str | None = None  # query over the selected rows, named `raw`, giving the stored table
 
 
 # Explicit types: trace ids look numeric but overflow BIGINT, so they stay text.
@@ -100,10 +102,81 @@ SOURCES = {
     },
 }
 
+# Market: metric_container rows name `<node>.<pod>`, mesh rows `<pod>.<direction>.<peer>`, runtime rows
+# `<app>.ts:<port>`. Each lands on its pod, node or app; the node a pod ran on and the mesh peer stay in the
+# KPI name. Span durations are microseconds and are stored as milliseconds.
+_MARKET_METRIC_CMDB = """CASE WHEN filename LIKE '%metric_container.csv' THEN split_part(cmdb_id, '.', 2)
+                              WHEN filename LIKE '%metric_node.csv' THEN cmdb_id
+                              ELSE split_part(cmdb_id, '.', 1) END"""
+_MARKET_METRIC_KPI = """CASE WHEN filename LIKE '%metric_container.csv' THEN kpi_name || ' (on ' || split_part(cmdb_id, '.', 1) || ')'
+                             WHEN filename LIKE '%metric_mesh.csv' THEN kpi_name || ' (' || substr(cmdb_id, strpos(cmdb_id, '.') + 1) || ')'
+                             ELSE kpi_name END"""
+# A span is a call when one of its children runs on another pod; the trace has no field saying so.
+_MARKET_CALLS = """
+WITH calls AS (SELECT DISTINCT p.trace_id, p.span_id FROM raw p JOIN raw c
+               ON c.trace_id = p.trace_id AND c.parent_id = p.span_id WHERE c.cmdb_id <> p.cmdb_id)
+SELECT raw.*, calls.span_id IS NOT NULL AS is_call, CAST(NULL AS VARCHAR) AS call_target
+FROM raw LEFT JOIN calls USING (trace_id, span_id)
+"""
+_MARKET = {
+    "trace": Source(
+        ("trace/trace_span.csv",),
+        {"timestamp": "BIGINT", "cmdb_id": "VARCHAR", "span_id": "VARCHAR", "trace_id": "VARCHAR", "duration": "DOUBLE",
+         "type": "VARCHAR", "status_code": "VARCHAR", "operation_name": "VARCHAR", "parent_span": "VARCHAR"},
+        select="cmdb_id, parent_span AS parent_id, span_id, trace_id, duration / 1000.0 AS duration, type AS span_type, "
+        "status_code, operation_name",
+        derive=_MARKET_CALLS,
+    ),
+    "log": Source(
+        ("log/log_service.csv", "log/log_proxy.csv"),
+        {"log_id": "VARCHAR", "timestamp": "BIGINT", "cmdb_id": "VARCHAR", "log_name": "VARCHAR", "value": "VARCHAR"},
+    ),
+    "metric_container": Source(
+        tuple(f"metric/metric_{kind}.csv" for kind in ("container", "mesh", "node", "runtime")),
+        {"timestamp": "BIGINT", "cmdb_id": "VARCHAR", "kpi_name": "VARCHAR", "value": "DOUBLE"},
+        select=f"{_MARKET_METRIC_CMDB} AS cmdb_id, {_MARKET_METRIC_KPI} AS kpi_name, value",
+        filename=True,
+    ),
+    "metric_app": Source(
+        ("metric/metric_service.csv",),
+        {"service": "VARCHAR", "timestamp": "BIGINT", "rr": "DOUBLE", "sr": "DOUBLE", "mrt": "DOUBLE", "count": "BIGINT"},
+        select="rr, sr, mrt, count AS cnt, service AS tc",
+    ),
+}
+SOURCES["Market1"] = SOURCES["Market2"] = _MARKET
+
+# OpenTelemetry Demo, as converted from the collector's OTLP files: span durations already in ms, `kind` is
+# the OTLP span kind, call_target the database or cache a client span reaches without a span of its own.
+SOURCES["OtelDemo"] = {
+    "trace": Source(
+        ("trace/trace_span.csv",),
+        {"timestamp": "BIGINT", "cmdb_id": "VARCHAR", "span_id": "VARCHAR", "trace_id": "VARCHAR",
+         "parent_id": "VARCHAR", "duration": "DOUBLE", "kind": "INTEGER", "status": "VARCHAR", "name": "VARCHAR",
+         "call_target": "VARCHAR"},
+        select="cmdb_id, span_id, trace_id, parent_id, duration, kind, status, name, nullif(call_target, '') AS call_target",
+    ),
+    "log": Source(
+        ("log/log_service.csv",),
+        {"log_id": "VARCHAR", "timestamp": "BIGINT", "cmdb_id": "VARCHAR", "log_name": "VARCHAR", "value": "VARCHAR"},
+    ),
+    "metric_container": Source(
+        ("metric/metric_container.csv",),
+        {"timestamp": "BIGINT", "cmdb_id": "VARCHAR", "kpi_name": "VARCHAR", "value": "DOUBLE"},
+    ),
+    "metric_app": Source(
+        ("metric/metric_app.csv",),
+        {"timestamp": "BIGINT", "tc": "VARCHAR", "sr": "DOUBLE", "mrt": "DOUBLE", "cnt": "BIGINT"},
+    ),
+}
+
 # Columns each view adds to its Parquet files.
 VIEW_COLUMNS = {
     "Bank": {"trace": "*, span_id LIKE '369-%' AS is_call, CAST(NULL AS VARCHAR) AS call_target"},
     "Telecom": {"trace": "*, call_type IN ('CSF', 'JDBC') AS is_call"},
+    "Market1": {},
+    "Market2": {},
+    # Client and producer spans call another component.
+    "OtelDemo": {"trace": "*, kind IN (3, 4) AS is_call"},
 }
 
 VIEWS = ("trace", "log", "metric_container", "metric_app")
@@ -138,16 +211,16 @@ def prepare_day(telemetry_dir: Path, parquet_dir: Path, day: str, memory_limit: 
         if not target.exists():
             partial = target.with_suffix(".parquet.part")
             files = "[" + ", ".join(_sql_str(str(telemetry_dir / day / p)) for p in source.csv_paths) + "]"
-            con.execute(
-                f"""
-                COPY (
-                    SELECT CAST({TS_SECONDS.format(source.timestamp)} AS DOUBLE) AS ts, {source.select}
-                    FROM read_csv({files}, header = true, columns = {_sql_columns(source.columns)},
-                                  delim = ',', quote = '"', escape = '"')
-                    ORDER BY ts
-                ) TO {_sql_str(str(partial))} (FORMAT parquet, COMPRESSION zstd)
-                """
-            )
+            rows = f"""
+                SELECT CAST({TS_SECONDS.format(source.timestamp)} AS DOUBLE) AS ts, {source.select}
+                FROM read_csv({files}, header = true, columns = {_sql_columns(source.columns)},
+                              delim = ',', quote = '"', escape = '"'{", filename = true" if source.filename else ""})
+            """
+            if source.derive:
+                con.execute(f"CREATE OR REPLACE TEMP TABLE raw AS {rows}")
+                rows = source.derive
+            con.execute(f"COPY ({rows} ORDER BY ts) TO {_sql_str(str(partial))} (FORMAT parquet, COMPRESSION zstd)")
+            con.execute("DROP TABLE IF EXISTS raw")
             partial.rename(target)
         counts[name] = con.execute(f"SELECT count(*) FROM read_parquet({_sql_str(str(target))})").fetchone()[0]
     con.close()

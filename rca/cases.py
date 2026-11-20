@@ -79,8 +79,10 @@ def parse_scoring_points(points: str) -> list[dict[str, str]]:
     return [graded[index] for index in sorted(graded)]
 
 
-def load_cases(system_dir: Path) -> list[Case]:
+def load_cases(system_dir: Path, system: str | None = None, prefix: str | None = None) -> list[Case]:
     """Read query.csv and attach to each query the record.csv faults it grades.
+
+    The system and the case-id prefix default to the directory name (Bank -> bank-001).
 
     A query can grade several faults, so faults are found by matching the
     graded fields against records inside the query window, not by row number.
@@ -90,7 +92,8 @@ def load_cases(system_dir: Path) -> list[Case]:
     with open(system_dir / "record.csv", newline="") as f:
         records = list(csv.DictReader(f))
 
-    prefix = system_dir.name.lower()
+    system = system or system_dir.name
+    prefix = prefix or system.lower()
     cases = []
     for index, query in enumerate(queries, start=1):
         start, end = parse_window(query["instruction"])
@@ -104,10 +107,14 @@ def load_cases(system_dir: Path) -> list[Case]:
                 if fields.get("time", r["datetime"]) == r["datetime"]
                 and fields.get("component", r["component"]) == r["component"]
                 and fields.get("reason", r["reason"]) == r["reason"]
+                and Fault(int(float(r["timestamp"])), r["component"], r["reason"], r["level"]) not in faults
             ]
-            if len(matches) != 1:
+            # Several faults of one query can agree on every graded field (Market: two network
+            # latencies, only the reason asked). They grade alike, so each takes the earliest record
+            # not taken yet. More matches than faults left to place is still ambiguous.
+            if not matches or len(matches) > len(graded) - len(faults):
                 raise ValueError(f"query {index}: {len(matches)} records in window match {fields}")
-            r = matches[0]
+            r = min(matches, key=lambda r: float(r["timestamp"]))
             faults.append(Fault(int(float(r["timestamp"])), r["component"], r["reason"], r["level"]))
         if len(set(faults)) != len(faults):
             raise ValueError(f"query {index}: two graded faults resolve to the same record")
@@ -120,7 +127,7 @@ def load_cases(system_dir: Path) -> list[Case]:
                 start=start,
                 end=end,
                 faults=tuple(faults),
-                system=system_dir.name,
+                system=system,
             )
         )
     return cases

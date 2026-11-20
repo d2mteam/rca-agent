@@ -22,21 +22,27 @@ def _fmt(ts: int) -> str:
 
 
 def _cases(args: argparse.Namespace):
-    cases = load_cases(args.data / "openrca" / args.system)
+    cases = _load_cases(args, args.system)
     days = args.days if args.days is not None else EVAL_DAYS.get(args.system)
     return [c for c in cases if c.day in days] if days else cases
 
 
+def _load_cases(args: argparse.Namespace, system: str):
+    s = systems.get(system)
+    return load_cases(args.data / "openrca" / s.path, system=s.name, prefix=s.case_prefix)
+
+
 def _connect(args: argparse.Namespace, system: str | None = None):
     system = system or args.system
-    return connect(args.data / "parquet" / system, system=system)
+    return connect(args.data / "parquet" / systems.get(system).path, system=system)
 
 
 def cmd_prepare(args: argparse.Namespace) -> None:
-    telemetry_dir = args.data / "openrca" / args.system / "telemetry"
+    path = systems.get(args.system).path
+    telemetry_dir = args.data / "openrca" / path / "telemetry"
     days = args.days or sorted(p.name for p in telemetry_dir.iterdir() if p.is_dir())
     for day in days:
-        counts = prepare_day(telemetry_dir, args.data / "parquet" / args.system, day, system=args.system)
+        counts = prepare_day(telemetry_dir, args.data / "parquet" / path, day, system=args.system)
         print(day, " ".join(f"{name}={n:,}" for name, n in counts.items()), flush=True)
 
 
@@ -114,7 +120,7 @@ def cmd_score(args: argparse.Namespace) -> None:
 def _system_of(case_id: str, default: str) -> str:
     """The system a case id names (telecom-023 is Telecom's), else the --system option."""
     prefix = case_id.split("-", 1)[0]
-    return next((name for name in systems.SYSTEMS if name.lower() == prefix), default)
+    return next((s.name for s in systems.SYSTEMS.values() if s.case_prefix == prefix), default)
 
 
 def _normal_window(case_id: str, cases, system: str) -> Case | None:
@@ -132,7 +138,7 @@ def _normal_window(case_id: str, cases, system: str) -> Case | None:
 
 def cmd_tool(args: argparse.Namespace) -> None:
     system = _system_of(args.case_id, args.system)
-    cases = load_cases(args.data / "openrca" / system)
+    cases = _load_cases(args, system)
     case = _normal_window(args.case_id, cases, system) or next((c for c in cases if c.case_id == args.case_id), None)
     if case is None:
         raise SystemExit(f"no case {args.case_id}")
