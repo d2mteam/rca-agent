@@ -182,6 +182,27 @@ def cmd_tool(args: argparse.Namespace) -> None:
         tools.logs(con, case, args.component, args.grep, args.samples)
 
 
+def cmd_ui(args: argparse.Namespace) -> None:
+    if args.action == "serve":
+        from rca.ui.server import serve  # the UI needs only the standard library; the API backend needs group "ui"
+        serve(args.data, args.runs, args.host, args.port)
+        return
+    from rca.ui.importer import import_transcript
+    from rca.ui.sessions import Store
+    for case_id in args.cases:
+        system = _system_of(case_id, args.system)
+        case = next((c for c in _load_cases(args, system) if c.case_id == case_id), None)
+        if case is None:
+            raise SystemExit(f"no case {case_id}")
+        try:
+            meta = import_transcript(Store(args.runs), args.transcript, case_id, system, args.run, case.instruction,
+                                     (case.start, case.end), sorted(case.asks), args.model, order=args.cases)
+        except SystemExit as e:
+            print(f"{case_id}: skipped, {e}")
+            continue
+        print(f"{case_id}: session {meta['id']}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m rca")
     parser.add_argument("--data", type=Path, default=Path("data"))
@@ -262,6 +283,18 @@ def main() -> None:
     p.add_argument("--reason", required=True)
     p.add_argument("--append", action="store_true", help="add to earlier answers (queries with several failures)")
     p.add_argument("--run", default="agent-tools")
+
+    ui = sub.add_parser("ui", help="web UI to run an agent on a case and watch it, or replay a saved session")
+    ui.set_defaults(func=cmd_ui)
+    actions = ui.add_subparsers(dest="action", required=True)
+    p = actions.add_parser("serve")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8765)
+    p = actions.add_parser("import", help="import a Claude Code transcript (JSONL) as sessions of the given cases")
+    p.add_argument("transcript", type=Path)
+    p.add_argument("cases", nargs="+")
+    p.add_argument("--run", required=True, help="the --run name the agent used, to find its answers")
+    p.add_argument("--model", default="")
 
     args = parser.parse_args()
     args.func(args)

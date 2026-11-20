@@ -4,3 +4,5 @@ __pycache__/
 data/
 .archive/
 runs/
+
+ui/node_modules/
