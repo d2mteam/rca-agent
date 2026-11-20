@@ -21,6 +21,8 @@ export const api = {
   answer: (id) => request(`/api/sessions/${id}/answer`),
   run: (system, kase, backend) => post("/api/run", { system, case: kase, backend }),
   stop: (id) => post(`/api/sessions/${id}/stop`),
+  profile: (system, language) => request(`/api/profile?system=${encodeURIComponent(system)}&language=${language}`),
+  runProfile: (system, backend, overwrite, windows) => post("/api/profile/run", { system, backend, overwrite, windows }),
   settings: () => request("/api/settings"),
   saveSettings: (s) => post("/api/settings", s),
   stream: (id, from) => new EventSource(`/api/sessions/${id}/stream?from=${from}`),

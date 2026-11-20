@@ -31,7 +31,7 @@ export default function App() {
   if (route[0] === "session" && route[1]) page = <SessionPage id={route[1]} onChange={refresh} />;
   else if (route[0] === "sessions") page = <SessionsPage sessions={sessions} />;
   else if (route[0] === "settings") page = <SettingsPage />;
-  else page = <CasesPage system={route[1]} sessions={sessions} onRun={refresh} />;
+  else page = <CasesPage system={route[1]} view={route[2]} sessions={sessions} onRun={refresh} />;
 
   return (
     <div className="layout">

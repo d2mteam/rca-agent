@@ -21,7 +21,9 @@ DEFAULTS = {
     "claude_code_model": "sonnet",
     "claude_code_use_provider": False,  # pass base URL, key and model to the claude CLI as ANTHROPIC_* variables
     "use_profile": True,
+    "language": "en",              # en: the project's instructions as they are; vi: explain and reason in Vietnamese
     "max_iterations": 80,
+    "profile_windows": {},         # system -> healthy windows the profile is written from (default: profiles.suggested)
 }
 
 

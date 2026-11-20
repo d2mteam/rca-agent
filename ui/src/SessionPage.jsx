@@ -314,7 +314,7 @@ export default function SessionPage({ id, onChange }) {
         <div className="panel">
           <div className="tabs tabs-small">
             {[["overview", "Tổng quan"], ["hyp", `Giả thuyết${hyps.length ? ` (${hyps.length})` : ""}`], ["timeline", "Dòng thời gian"],
-              ["sources", "Nguồn thông tin"], ["answer", "Đáp án"]].map(([k, label]) => (
+              ["sources", "Nguồn thông tin"], meta.kind === "profile" ? ["profile", "Hồ sơ"] : ["answer", "Đáp án"]].map(([k, label]) => (
               <a key={k} className={"tab" + (tab === k ? " active" : "")} onClick={() => setTab(k)}>{label}</a>
             ))}
           </div>
@@ -330,6 +330,7 @@ export default function SessionPage({ id, onChange }) {
                   <dt>Hệ thống</dt><dd>{meta.system}</dd>
                   <dt>Run</dt><dd className="mono">{meta.run}</dd>
                   <dt>Hồ sơ hệ thống</dt><dd>{meta.profile ? "có đọc" : "không"}</dd>
+                  <dt>Ngôn ngữ</dt><dd>{meta.language === "vi" ? "Tiếng Việt" : "English"}</dd>
                   <dt>Bắt đầu</dt><dd>{clock(meta.created)}</dd>
                   {meta.imported && <><dt>Nguồn</dt><dd className="small mono">{meta.imported.split("/").slice(-1)[0]}</dd></>}
                 </dl>
@@ -339,6 +340,15 @@ export default function SessionPage({ id, onChange }) {
             {tab === "timeline" && <Timeline events={visible} />}
             {tab === "sources" && <Sources events={visible} />}
             {tab === "answer" && <Answer id={id} status={meta.status} />}
+            {tab === "profile" && (
+              <div>
+                <div className="section-title">Hồ sơ được ghi vào</div>
+                <div className="mono small">{meta.output}</div>
+                <div className="section-title">Cửa sổ khỏe</div>
+                {(meta.windows || []).map((w) => <div key={w} className="mono small">{w}</div>)}
+                <p><a href={`#/cases/${meta.system}/profile`}>Mở hồ sơ hệ thống {meta.system} →</a></p>
+              </div>
+            )}
           </div>
         </div>
       </div>

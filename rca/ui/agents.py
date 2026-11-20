@@ -52,26 +52,43 @@ Give: the submitted answer; the hypotheses you tested and why each was supported
 profile changed a decision; and your confidence (low/med/high). Keep it compact."""
 
 
-def profile_path(system: str) -> Path | None:
-    name = {"Market1": "market", "Market2": "market"}.get(system, system.lower())
-    path = ROOT / "profiles" / f"{name}.md"
-    return path if path.exists() else None
+# Added to the instructions only when the user picks Vietnamese in Settings; the default runs them unchanged.
+VIETNAMESE = """
+
+## Language
+Think and reason in Vietnamese, and write your explanations in Vietnamese: what you write between tool commands, the
+--if-true, --if-false and --evidence text of your hypotheses, and the final report. Keep in their original form: proper names, technical
+terms (for example CPU, latency, packet loss, exclusive time, trace, span, change point), component names, KPI and
+metric names, tool names, commands and tool output. The --component and --reason you pass to `hypothesis add` and
+`submit` must stay the exact strings from the lists the question prints."""
 
 
-def instructions(case: str, system: str, run: str, use_profile: bool) -> str:
-    profile = profile_path(system) if use_profile else None
+def profile_path(system: str, language: str = "en") -> Path | None:
+    """The profile the agent reads: the Vietnamese one when chosen and written, else the English one."""
+    from rca.ui import profiles
+
+    for path in ([profiles.path(system, "vi")] if language == "vi" else []) + [profiles.path(system)]:
+        if path.exists():
+            return path
+    return None
+
+
+def instructions(case: str, system: str, run: str, use_profile: bool, language: str = "en") -> str:
+    profile = profile_path(system, language) if use_profile else None
     rule = (f"- First read {profile}: a profile of this system written from healthy periods (no faults). It describes\n"
             "  topology, which data each component has, normal levels and what the statistical tools report as noise\n"
             "  when nothing is wrong. Use it as background.\n") if profile else "- There is no system profile for this system.\n"
-    return RULES.format(case=case, run=run, root=ROOT, profile_rule=rule)
+    return RULES.format(case=case, run=run, root=ROOT, profile_rule=rule) + (VIETNAMESE if language == "vi" else "")
 
 
 class Run(threading.Thread):
     """One agent run; `emit` receives every UI event, `finish` the final status."""
 
-    def __init__(self, backend: str, case: str, system: str, run: str, emit, finish):
+    def __init__(self, backend: str, case: str, system: str, run: str, emit, finish, profile_task=None):
         super().__init__(daemon=True)
         self.backend, self.case, self.system, self.run_name = backend, case, system, run
+        # (instructions, output path) when this run writes a system profile instead of solving a case.
+        self.profile_task = profile_task
         self.emit, self.finish = emit, finish
         self.stopped = threading.Event()
         self.process: subprocess.Popen | None = None
@@ -92,11 +109,15 @@ class Run(threading.Thread):
     # --- claude code -------------------------------------------------------------------------------
     def _claude_code(self) -> str:
         s = cfg.load()
-        prompt = instructions(self.case, self.system, self.run_name, s["use_profile"])
-        allowed = ["Bash(uv run python -m rca tool:*)"]
-        profile = profile_path(self.system) if s["use_profile"] else None
-        if profile:
-            allowed.append(f"Read(//{str(profile).lstrip('/')})")
+        if self.profile_task:
+            prompt, out = self.profile_task
+            allowed = [f"Bash(uv run python -m rca --system {self.system} tool:*)", f"Write(//{str(out).lstrip('/')})"]
+        else:
+            prompt = instructions(self.case, self.system, self.run_name, s["use_profile"], s["language"])
+            allowed = ["Bash(uv run python -m rca tool:*)"]
+            profile = profile_path(self.system, s["language"]) if s["use_profile"] else None
+            if profile:
+                allowed.append(f"Read(//{str(profile).lstrip('/')})")
         env = {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")} | cfg.claude_env(s)
         model = s["model"] if s["claude_code_use_provider"] and s["model"].strip() else s["claude_code_model"]
         command = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", model,
@@ -143,8 +164,13 @@ class Run(threading.Thread):
             raise ValueError("no model configured: open Settings")
         credentials = {"auth_token" if s["auth"] == "auth_token" else "api_key": s["api_key"]} if s["api_key"] else {}
         client = anthropic.Anthropic(base_url=s["base_url"].strip() or None, **credentials)
-        prompt = instructions(self.case, self.system, self.run_name, s["use_profile"])
-        profile = profile_path(self.system) if s["use_profile"] else None
+        if self.profile_task:
+            prompt, out = self.profile_task
+            profile = None
+        else:
+            prompt = instructions(self.case, self.system, self.run_name, s["use_profile"], s["language"])
+            profile = profile_path(self.system, s["language"]) if s["use_profile"] else None
+            out = None
 
         @beta_tool
         def bash(command: str) -> str:
@@ -170,8 +196,27 @@ class Run(threading.Thread):
             self.emit({"kind": "tool_result", "id": call_id, "output": text, "is_error": not ok, "ms": 0})
             return text
 
+        @beta_tool
+        def write(file_path: str, content: str) -> str:
+            """Write a text file, replacing it if it exists.
+
+            Args:
+                file_path: Absolute path of the file.
+                content: The full content to write.
+            """
+            call_id = f"call-{time.time_ns()}"
+            self.emit({"kind": "tool_call", "id": call_id, "name": "Write", "command": file_path, "rca": []})
+            ok = out is not None and Path(file_path).resolve() == out
+            if ok:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(content)
+            text = f"wrote {len(content)} characters to {out}" if ok else "Permission denied: only the profile file can be written."
+            self.emit({"kind": "tool_result", "id": call_id, "output": text, "is_error": not ok, "ms": 0})
+            return text
+
+        tools = [bash, write] if out else [bash, read] if profile else [bash]
         params = {"model": s["model"].strip(), "max_tokens": 16000, "max_iterations": int(s["max_iterations"]),
-                  "tools": [bash, read] if profile else [bash],
+                  "tools": tools,
                   "messages": [{"role": "user", "content": prompt}]}
         if cfg.official(s):
             params["thinking"] = {"type": "adaptive", "display": "summarized"} if s["thinking"] else {"type": "adaptive"}
@@ -226,7 +271,10 @@ class Run(threading.Thread):
             args = shlex.split(command)
         except ValueError as e:
             return f"cannot parse the command: {e}", True
-        if args[:5] != ["uv", "run", "python", "-m", "rca"] or args[5:6] != ["tool"] or any(
+        rest = args[5:]
+        if rest[:2] == ["--system", self.system]:
+            rest = rest[2:]
+        if args[:5] != ["uv", "run", "python", "-m", "rca"] or rest[:1] != ["tool"] or any(
                 ch in command for ch in ";&|`$<>\n"):
             return "Permission denied: only `uv run python -m rca tool <name> ...` commands are allowed.", True
         result = subprocess.run([sys.executable, "-m", "rca", *args[5:]], cwd=ROOT, capture_output=True, text=True,

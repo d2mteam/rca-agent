@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "./api.js";
 import { ASKS } from "./util.js";
+import ProfilePanel from "./ProfilePanel.jsx";
 
-export default function CasesPage({ system, sessions, onRun }) {
+export default function CasesPage({ system, view, sessions, onRun }) {
   const [systems, setSystems] = useState([]);
   const [cases, setCases] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -11,6 +12,7 @@ export default function CasesPage({ system, sessions, onRun }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const current = system || (systems[0] && systems[0].name);
+  const onProfile = view === "profile";
 
   useEffect(() => {
     api.systems().then(setSystems).catch((e) => setError(e.message));
@@ -48,16 +50,24 @@ export default function CasesPage({ system, sessions, onRun }) {
   return (
     <div className="page">
       <div className="page-header">
-        <div className="breadcrumb">Câu hỏi / {current || "…"}</div>
-        <h1>Câu hỏi</h1>
+        <div className="breadcrumb">Hệ thống / {current || "…"}</div>
+        <div className="title-row">
+          <h1>{current || "…"}</h1>
+          <div className="segmented">
+            <a className={!onProfile ? "active" : ""} href={`#/cases/${current}`}>Câu hỏi</a>
+            <a className={onProfile ? "active" : ""} href={`#/cases/${current}/profile`}>Hồ sơ hệ thống</a>
+          </div>
+        </div>
         <div className="tabs">
           {systems.map((s) => (
-            <a key={s.name} href={`#/cases/${s.name}`} className={"tab" + (s.name === current ? " active" : "")}>
+            <a key={s.name} href={`#/cases/${s.name}${onProfile ? "/profile" : ""}`} className={"tab" + (s.name === current ? " active" : "")}>
               {s.name} <span className="tab-count">{s.cases}</span>
+              {s.profiles && (s.profiles.en || s.profiles.vi) && <span className="tab-count"> · hồ sơ</span>}
             </a>
           ))}
         </div>
       </div>
+      {onProfile && current ? <ProfilePanel system={current} onRun={onRun} /> : <>
       <div className="content">
         {error && <div className="alert alert-error">{error}</div>}
         <div className="card">
@@ -116,6 +126,7 @@ export default function CasesPage({ system, sessions, onRun }) {
           <div className="composer-hint">Chọn một câu hỏi trong bảng để chạy agent, hoặc mở một phiên đã có.</div>
         )}
       </div>
+      </>}
     </div>
   );
 }

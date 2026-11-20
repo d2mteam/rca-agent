@@ -17,6 +17,7 @@ from rca import systems
 from rca.cases import CST, load_cases
 from rca.scoring import load_predictions, score_case
 from rca.ui import settings as cfg
+from rca.ui import profiles
 from rca.ui.agents import Run, profile_path
 from rca.ui.sessions import Store
 
@@ -57,6 +58,7 @@ class App:
             if cases:
                 prepared = self.data / "parquet" / s.path
                 out.append({"name": name, "cases": len(cases), "profile": profile_path(name) is not None,
+                            "profiles": {lang: profiles.path(name, lang).exists() for lang in ("en", "vi")},
                             "prepared_days": sorted(p.name for p in prepared.iterdir() if p.is_dir()) if prepared.exists() else []})
         return out
 
@@ -80,7 +82,7 @@ class App:
         model = s["model"] if backend == "api" or s["claude_code_use_provider"] else s["claude_code_model"]
         meta = self.store.create(case=case_id, system=system, backend=backend, model=model,
                                  base_url=s["base_url"] if backend == "api" or s["claude_code_use_provider"] else "",
-                                 profile=bool(s["use_profile"] and profile_path(system)))
+                                 profile=bool(s["use_profile"] and profile_path(system)), language=s["language"])
         session_id = meta["id"]
         self.store.append(session_id, {"kind": "question", "text": case.instruction,
                                        "window": [case.start, case.end], "asks": sorted(case.asks)})
@@ -94,13 +96,47 @@ class App:
         run.start()
         return meta
 
+    def profile_windows(self, system: str) -> tuple[list[str], list[str]]:
+        """The windows set for a system (or the suggestion when none is set) and the suggestion itself."""
+        suggestion = profiles.suggested(self.data, system, self.cases(system))
+        return cfg.load()["profile_windows"].get(system) or suggestion, suggestion
+
+    def start_profile(self, system: str, backend: str, overwrite: bool, chosen: list[str] | None) -> dict:
+        if backend not in ("claude_code", "api"):
+            raise ValueError(f"unknown backend {backend!r}")
+        if chosen is not None:
+            profiles.check(chosen, self.cases(system))
+            cfg.save({"profile_windows": {**cfg.load()["profile_windows"], system: chosen}})
+        chosen = self.profile_windows(system)[0]
+        s = cfg.load()
+        prompt, out = profiles.instructions(system, chosen, self.cases(system), s["language"])
+        if out.exists() and not overwrite:
+            raise ValueError(f"{out.relative_to(profiles.ROOT)} already exists")
+        model = s["model"] if backend == "api" or s["claude_code_use_provider"] else s["claude_code_model"]
+        meta = self.store.create(case=f"{system.lower()}-profile", system=system, backend=backend, model=model,
+                                 kind="profile", output=str(out), windows=chosen, language=s["language"],
+                                 base_url=s["base_url"] if backend == "api" or s["claude_code_use_provider"] else "")
+        session_id = meta["id"]
+        self.store.append(session_id, {"kind": "question", "text": f"Viết hồ sơ hệ thống {system} từ các cửa sổ khỏe: "
+                                       + ", ".join(chosen), "asks": []})
+
+        def finish(status: str):
+            self.store.update(session_id, status=status, finished=time.time())
+            self.active.pop(session_id, None)
+
+        run = Run(backend, meta["case"], system, meta["run"], lambda e: self.store.append(session_id, e), finish,
+                  profile_task=(prompt, out))
+        self.active[session_id] = run
+        run.start()
+        return meta
+
     def score(self, session_id: str) -> float | None:
         result = self.answer(session_id)
         return result["score"] if result else None
 
     def answer(self, session_id: str) -> dict | None:
         meta = self.store.meta(session_id)
-        if not meta:
+        if not meta or meta.get("kind") == "profile":
             return None
         case = self.case(meta["system"], meta["case"])
         predictions = self.runs / meta["run"] / "predictions.jsonl"
@@ -185,6 +221,14 @@ def handler(app: App):
                     return self._json(app.store.list())
                 if url.path == "/api/settings":
                     return self._json(cfg.public(cfg.load()))
+                if url.path == "/api/profile":
+                    system = q.get("system", "Bank")
+                    file = profiles.path(system, q.get("language", "en"))
+                    chosen, suggestion = app.profile_windows(system)
+                    sessions = [m for m in app.store.list() if m.get("kind") == "profile" and m["system"] == system]
+                    return self._json({"path": str(file.relative_to(profiles.ROOT)), "exists": file.exists(),
+                                       "content": file.read_text() if file.exists() else "", "windows": chosen,
+                                       "suggested": suggestion, "sessions": sessions[:10]})
                 if parts[:2] == ["api", "sessions"] and len(parts) >= 3:
                     session_id = parts[2]
                     meta = app.store.meta(session_id)
@@ -215,6 +259,9 @@ def handler(app: App):
                     return self._json(app.start(body["system"], body["case"], body.get("backend", "claude_code")))
                 if url.path == "/api/settings":
                     return self._json(cfg.public(cfg.save(body)))
+                if url.path == "/api/profile/run":
+                    return self._json(app.start_profile(body["system"], body.get("backend", "claude_code"),
+                                                        bool(body.get("overwrite")), body.get("windows")))
                 if parts[:2] == ["api", "sessions"] and len(parts) == 4 and parts[3] == "stop":
                     run = app.active.get(parts[2])
                     if run:

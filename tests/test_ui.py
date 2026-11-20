@@ -82,3 +82,38 @@ def test_api_backend_runs_only_rca_tool_commands():
                     "uv run python -m rca tool question bank-114 | head", "python -m rca tool question bank-114"):
         output, is_error = run._execute(command)
         assert is_error and output.startswith("Permission denied"), command
+
+
+def test_vietnamese_is_added_only_when_chosen():
+    from rca.ui.agents import instructions
+
+    english = instructions("bank-114", "Bank", "ui-x", True)
+    vietnamese = instructions("bank-114", "Bank", "ui-x", True, "vi")
+    assert "Vietnamese" not in english
+    assert vietnamese.startswith(english) and "exact strings from the lists" in vietnamese[len(english):]
+
+
+def test_profile_windows_are_checked_and_written_into_the_instructions():
+    import pytest
+    from rca.cases import Case
+    from rca.ui import profiles
+
+    cases = [Case("bank-001", "task_1", "", frozenset({"time"}), 1614839400, 1614841200, (), "Bank")]  # 03-04 14:30-15:00
+    with pytest.raises(ValueError, match="not a window"):
+        profiles.check(["2021_03_06-0930"], cases)
+    with pytest.raises(ValueError, match="within an hour"):
+        profiles.check(["normal-2021_03_04-1530"], cases)
+    english, out = profiles.instructions("Bank", ["normal-2021_03_06-0930"], cases)
+    vietnamese, out_vi = profiles.instructions("Bank", ["normal-2021_03_06-0930"], cases, "vi")
+    assert "normal-2021_03_06-0930" in english and "Vietnamese" not in english
+    assert out.name == "bank.md" and out_vi.name == "bank.vi.md"
+    # Same instructions apart from the file written and the added Language section.
+    assert vietnamese.replace("bank.vi.md", "bank.md").startswith(english) and "## Language" in vietnamese
+
+
+def test_api_shell_accepts_only_its_own_system():
+    from rca.ui.agents import Run
+
+    run = Run("api", "telecom-profile", "Telecom", "ui-test", lambda e: None, lambda s: None)
+    output, is_error = run._execute("uv run python -m rca --system Bank tool question normal-2020_05_28-0200")
+    assert is_error and output.startswith("Permission denied")
