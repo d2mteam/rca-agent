@@ -1,40 +1,99 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api.js";
 import Markdown from "./Markdown.jsx";
-import { ASKS, STATUS, clock, cstWindow, duration, latestHypotheses, parseHypotheses, steps, toolNames } from "./util.js";
+import { ASKS, STATUS, TOOL_INFO, clock, cstWindow, describeCall, duration, explainError, hypothesisOps, latestHypotheses,
+  parseHypotheses, steps, toolNames } from "./util.js";
 
 const TOOL_TONE = {
   question: "grey", overview: "blue", calls: "cyan", series: "geekblue", logs: "purple", baro: "orange",
   exclusive: "magenta", traces: "volcano", onset: "gold", hypothesis: "green", submit: "red", Read: "lime",
 };
 
-function ToolCard({ step }) {
+function HypothesisOps({ ops, output }) {
+  // `hypothesis add` prints "hypothesis #N added" once per call, in order.
+  const added = [...(output || "").matchAll(/hypothesis #(\d+) added/g)].map((m) => m[1]);
+  let a = 0;
+  return ops.map((o, i) => {
+    if (o.op === "add") { const n = added[a++]; return (
+      <div key={i} className="hop hop-add">
+        <div className="hop-title">💡 Nêu giả thuyết{n ? ` #${n}` : ""}: <b className="mono">{o.component}</b> — {o.reason}</div>
+        <div className="hop-row"><span className="hop-label">Nếu đúng sẽ thấy</span>{o.ifTrue}</div>
+        <div className="hop-row"><span className="hop-label">Nếu sai sẽ thấy</span>{o.ifFalse}</div>
+      </div>
+    ); }
+    if (o.op === "test") {
+      const tone = o.status === "supported" ? "ok" : o.status === "refuted" ? "bad" : "open";
+      const verb = o.status === "supported" ? "✓ Ủng hộ" : o.status === "refuted" ? "✗ Bác bỏ" : "… Để mở";
+      return (
+        <div key={i} className={`hop hop-${tone}`}>
+          <div className="hop-title">{verb} giả thuyết #{o.id}</div>
+          <div className="hop-row"><span className="hop-label">Vì</span>{o.evidence}</div>
+        </div>
+      );
+    }
+    return (
+      <div key={i} className="hop hop-submit">
+        <div className="hop-title">📨 Nộp đáp án</div>
+        <div className="mono small">{o.time} · {o.component} · {o.reason}</div>
+      </div>
+    );
+  });
+}
+
+function ToolCard({ step, n }) {
   const [open, setOpen] = useState(false);
+  const [raw, setRaw] = useState(false);
   const r = step.result;
   const names = toolNames(step);
   const output = r ? r.output || "" : "";
   const lines = output.split("\n");
   const long = lines.length > 16;
-  const hyps = names.includes("hypothesis") || names.includes("submit") ? parseHypotheses(output) : [];
-  const isRead = step.name === "Read";
+  const ops = hypothesisOps(step);
+  const listed = !ops.length && names.includes("hypothesis") ? parseHypotheses(output) : [];
+  const isRead = ["Read", "Write", "read_profile", "write_profile"].includes(step.name);
+  const details = (step.rca || []).map((c) => describeCall(c)).filter(Boolean);
+  const purpose = names.map((x) => TOOL_INFO[x]).filter(Boolean);
   return (
-    <div className={"tool-card" + (r && r.is_error ? " tool-error" : "")} id={`step-${step.id}`}>
-      <div className="tool-head" onClick={() => setOpen(!open)}>
-        <span className="tool-kind">{isRead ? "📄 Đọc tài liệu" : "⌘ Gọi công cụ"}</span>
-        {names.map((n) => <span key={n} className={`tag tag-${TOOL_TONE[n] || "blue"}`}>{n}</span>)}
+    <div className={"tool-card" + (r && r.is_error ? " tool-error" : "") + (ops.length ? " tool-hyp" : "")} id={`step-${step.id}`}>
+      <div className="tool-head">
+        <span className="step-no">Bước {n}</span>
+        <span className="tool-kind">{isRead ? "📄" : "⌘"}</span>
+        {names.map((x) => <span key={x} className={`tag tag-${TOOL_TONE[x] || "blue"}`} title={TOOL_INFO[x] || ""}>{x}</span>)}
         <span className="tool-state">
           {!r ? <span className="spinner" /> : r.is_error ? <span className="err">✗ lỗi</span> : <span className="ok">✓</span>}
           {r && r.ms != null && <span className="muted"> {duration(r.ms)}</span>}
         </span>
       </div>
-      <div className="tool-command mono">{step.command}</div>
-      {hyps.length > 0 && <HypothesisTable hyps={hyps} compact />}
-      {r && (
-        <div className="tool-output">
-          <div className="tool-output-label">Công cụ trả về</div>
-          <pre className={"output" + (long && !open ? " clipped" : "")}>{long && !open ? lines.slice(0, 16).join("\n") : output}</pre>
-          {long && <button className="btn btn-link" onClick={() => setOpen(!open)}>{open ? "Thu gọn" : `Xem đủ ${lines.length} dòng`}</button>}
+      <div className="tool-purpose">
+        {purpose.length > 0 && <span>{purpose.join(" · ")}</span>}
+        {details.length > 0 && <span className="tool-detail"> → {details.join("; ")}</span>}
+        {isRead && step.name.length < 6 && <span className="mono"> {step.command}</span>}
+      </div>
+      {r && r.is_error && <div className="tool-why">⚠ {explainError(output)}</div>}
+      {listed.length > 0 ? (
+        <div className="hop-list">
+          <div className="tool-output-label">Sổ giả thuyết lúc này</div>
+          <HypothesisCards hyps={listed} events={[]} />
+          <button className="btn btn-link small-link" onClick={() => setRaw(!raw)}>{raw ? "Ẩn lệnh gốc" : "Xem lệnh gốc và đầu ra"}</button>
+          {raw && <><div className="tool-command mono">{step.command}</div><pre className="output">{output}</pre></>}
         </div>
+      ) : ops.length > 0 ? (
+        <>
+          <HypothesisOps ops={ops} output={output} />
+          <button className="btn btn-link small-link" onClick={() => setRaw(!raw)}>{raw ? "Ẩn lệnh gốc" : "Xem lệnh gốc và đầu ra"}</button>
+          {raw && <><div className="tool-command mono">{step.command}</div><pre className="output">{output}</pre></>}
+        </>
+      ) : (
+        <>
+          {!isRead && <div className="tool-command mono">{step.command}</div>}
+          {r && (
+            <div className="tool-output">
+              <div className="tool-output-label">Công cụ trả về</div>
+              <pre className={"output" + (long && !open ? " clipped" : "")}>{long && !open ? lines.slice(0, 16).join("\n") : output}</pre>
+              {long && <button className="btn btn-link" onClick={() => setOpen(!open)}>{open ? "Thu gọn" : `Xem đủ ${lines.length} dòng`}</button>}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -60,7 +119,7 @@ function Prompt({ text }) {
   );
 }
 
-function Step({ step }) {
+function Step({ step, n }) {
   switch (step.kind) {
     case "question":
       return (
@@ -76,13 +135,14 @@ function Step({ step }) {
     case "prompt":
       return <Prompt text={step.text} />;
     case "info":
+      if (step.backend === "claude_code") return null; // the CLI reports the model it actually runs just after
       return <div className="info-line">Model <b>{step.model}</b>{step.backend ? ` · ${step.backend === "api" ? "Claude API" : "Claude Code"}` : ""}{step.base_url ? ` · ${step.base_url}` : ""}</div>;
     case "thinking":
       return <div className="msg msg-agent"><div className="avatar">A</div><Thinking text={step.text} /></div>;
     case "text":
       return <div className="msg msg-agent"><div className="avatar">A</div><div className="agent-text"><Markdown text={step.text} /></div></div>;
     case "tool_call":
-      return <div className="msg msg-agent"><div className="avatar avatar-tool">⌘</div><ToolCard step={step} /></div>;
+      return <div className="msg msg-agent"><div className="avatar avatar-tool">⌘</div><ToolCard step={step} n={n} /></div>;
     case "error":
       return <div className="alert alert-error">{step.text}</div>;
     case "done":
@@ -99,27 +159,66 @@ function Step({ step }) {
 }
 
 function HypothesisTable({ hyps, compact }) {
-  const tone = { supported: "green", refuted: "red", open: "blue" };
-  const label = { supported: "ủng hộ", refuted: "bác", open: "đang mở" };
+  return <HypothesisCards hyps={hyps} events={[]} compact={compact} />;
+}
+
+function HypothesisCards({ hyps, events }) {
+  const label = { supported: "ĐƯỢC ỦNG HỘ", refuted: "BỊ BÁC", open: "ĐANG MỞ" };
+  const calls = steps(events).filter((s) => s.kind === "tool_call");
+  const stepNo = (s) => calls.indexOf(s) + 1;
+  const where = (h) => {
+    const added = calls.find((s) => hypothesisOps(s).some((o) => o.op === "add" && o.component === h.component && o.reason === h.reason));
+    const tested = calls.filter((s) => hypothesisOps(s).some((o) => o.op === "test" && String(o.id) === String(h.id)));
+    return { added, tested };
+  };
+  const go = (s) => document.getElementById(`step-${s.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
   return (
-    <table className={"table" + (compact ? " table-compact" : "")}>
-      <thead><tr><th>#</th><th>Máy</th><th>Lý do</th><th>Trạng thái</th>{!compact && <th>Nếu đúng / nếu sai / bằng chứng</th>}</tr></thead>
-      <tbody>
-        {hyps.map((h) => (
-          <tr key={h.id}>
-            <td>{h.id}</td><td className="mono">{h.component}</td><td>{h.reason}</td>
-            <td><span className={`tag tag-${tone[h.status]}`}>{label[h.status]}</span></td>
-            {!compact && (
-              <td className="small">
-                <div><b>Nếu đúng:</b> {h.ifTrue}</div>
-                <div><b>Nếu sai:</b> {h.ifFalse}</div>
-                {h.evidence.map((e, i) => <div key={i}><b>Bằng chứng:</b> {e}</div>)}
-              </td>
-            )}
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <div className="hyp-cards">
+      {hyps.map((h) => {
+        const { added, tested } = where(h);
+        return (
+          <div key={h.id} className={`hyp-card hyp-${h.status}`}>
+            <div className="hyp-head">
+              <span className="hyp-id">#{h.id}</span>
+              <span className="hyp-name"><b className="mono">{h.component}</b> — {h.reason}</span>
+              <span className={`hyp-status hyp-status-${h.status}`}>{label[h.status]}</span>
+            </div>
+            <div className="hyp-body">
+              <div className="hop-row"><span className="hop-label">Nếu đúng sẽ thấy</span>{h.ifTrue || "–"}</div>
+              <div className="hop-row"><span className="hop-label">Nếu sai sẽ thấy</span>{h.ifFalse || "–"}</div>
+              <div className="hyp-verdict">
+                <div className="hop-label">{h.status === "refuted" ? "Vì sao bị bác" : h.status === "supported" ? "Vì sao được ủng hộ" : "Bằng chứng"}</div>
+                {h.evidence.length ? h.evidence.map((e, i) => <div key={i} className="hyp-evidence">{e}</div>)
+                  : <div className="muted">Chưa kiểm.</div>}
+              </div>
+              {(added || tested.length > 0) && (
+                <div className="hyp-links">
+                  {added && <a onClick={() => go(added)}>nêu ở bước {stepNo(added)}</a>}
+                  {tested.map((s) => <a key={s.id} onClick={() => go(s)}>kiểm ở bước {stepNo(s)}</a>)}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Problems({ events }) {
+  const calls = steps(events).filter((s) => s.kind === "tool_call");
+  const failed = calls.map((s, i) => ({ s, n: i + 1 })).filter(({ s }) => s.result && s.result.is_error);
+  const errors = events.filter((e) => e.kind === "error");
+  if (!failed.length && !errors.length) return <div className="muted small">Không có bước nào lỗi.</div>;
+  return (
+    <div>
+      {errors.map((e, i) => <div key={i} className="problem problem-run">⛔ {e.text}</div>)}
+      {failed.map(({ s, n }) => (
+        <div key={s.id} className="problem" onClick={() => document.getElementById(`step-${s.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}>
+          <span className="step-no">Bước {n}</span> {explainError(s.result.output)}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -161,9 +260,9 @@ function Timeline({ events }) {
 function Sources({ events }) {
   const all = steps(events);
   const prompt = events.find((e) => e.kind === "prompt");
-  const reads = all.filter((s) => s.kind === "tool_call" && s.name === "Read");
+  const reads = all.filter((s) => s.kind === "tool_call" && ["Read", "read_profile"].includes(s.name));
   const counts = {};
-  for (const s of all) if (s.kind === "tool_call" && s.name !== "Read") for (const n of toolNames(s)) counts[n] = (counts[n] || 0) + 1;
+  for (const s of all) if (s.kind === "tool_call" && !["Read", "read_profile"].includes(s.name)) for (const n of toolNames(s)) counts[n] = (counts[n] || 0) + 1;
   const max = Math.max(1, ...Object.values(counts));
   return (
     <div>
@@ -171,7 +270,7 @@ function Sources({ events }) {
       {prompt && <div className="source">📋 Lời dặn ({prompt.text.length} ký tự)</div>}
       {reads.length ? reads.map((r) => (
         <div key={r.id} className="source link" onClick={() => document.getElementById(`step-${r.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}>
-          📄 {r.command.split("/").slice(-2).join("/")}
+          📄 {r.name === "read_profile" ? "hồ sơ hệ thống" : r.command.split("/").slice(-2).join("/")}
         </div>
       )) : <div className="muted">Không đọc tài liệu nào ngoài lời dặn.</div>}
       <div className="section-title">Công cụ đã dùng</div>
@@ -186,20 +285,27 @@ function Sources({ events }) {
   );
 }
 
+// A case counts as solved only at a full score.
+function verdict(score) {
+  return score >= 1 ? { tone: "green", label: "ĐÚNG" } : score > 0 ? { tone: "orange", label: "ĐÚNG MỘT PHẦN" }
+    : { tone: "red", label: "SAI" };
+}
+
 function Answer({ id, status }) {
   const [a, setA] = useState(null);
   const [err, setErr] = useState("");
   useEffect(() => {
-    if (status === "running") return;
+    if (status === "running" || status === "queued") return;
     api.answer(id).then(setA).catch((e) => setErr(e.message));
   }, [id, status]);
-  if (status === "running") return <div className="muted">Đáp án chỉ hiện khi agent đã chạy xong.</div>;
+  if (status === "running" || status === "queued") return <div className="muted">Đáp án chỉ hiện khi agent đã chạy xong.</div>;
   if (err) return <div className="alert alert-error">{err}</div>;
   if (!a) return <div className="muted">Đang tải…</div>;
+  const v = verdict(a.score);
   return (
     <div>
       <div className="score-row">
-        <span className={`tag tag-${a.solved ? "green" : a.score > 0 ? "orange" : "red"}`}>{a.solved ? "GIẢI ĐÚNG" : "CHƯA ĐÚNG"}</span>
+        <span className={`tag tag-${v.tone}`}>{v.label}</span>
         <span className="score">{Math.round(a.score * 100)}%</span>
       </div>
       <div className="section-title">Từng ô được chấm</div>
@@ -233,12 +339,13 @@ export default function SessionPage({ id, onChange }) {
     setMeta(null); setEvents([]); setReplay(null); setError("");
     api.session(id).then(({ meta, events }) => {
       setMeta(meta); setEvents(events);
-      if (meta.status === "running") {
+      if (meta.status === "running" || meta.status === "queued") {
         source = api.stream(id, events.length);
         source.onmessage = (m) => setEvents((prev) => {
           const e = JSON.parse(m.data);
           return prev.some((p) => p.i === e.i) ? prev : [...prev, e];
         });
+        source.addEventListener("meta", (m) => setMeta(JSON.parse(m.data)));
         source.addEventListener("end", (m) => { setMeta(JSON.parse(m.data)); source.close(); onChange(); });
       }
     }).catch((e) => setError(e.message));
@@ -280,10 +387,15 @@ export default function SessionPage({ id, onChange }) {
         <div className="title-row">
           <h1>{meta.case}</h1>
           <span className={`tag tag-${st.tone}`}>{meta.status === "running" && <span className="spinner small" />} {st.label}</span>
+          {meta.kind !== "profile" && meta.score != null && (
+            <a className={`tag tag-${verdict(meta.score).tone}`} onClick={() => setTab("answer")} title="Xem đối chiếu với đáp án">
+              {verdict(meta.score).label} · {Math.round(meta.score * 100)}%
+            </a>
+          )}
           <span className="muted">{meta.imported ? "phiên đã lưu" : meta.backend === "api" ? "Claude API" : "Claude Code"} · {meta.model || "?"}</span>
           <span className="spacer" />
-          {meta.status === "running" ? (
-            <button className="btn btn-danger" onClick={() => api.stop(id)}>■ Dừng</button>
+          {meta.status === "running" || meta.status === "queued" ? (
+            <button className="btn btn-danger" onClick={() => api.stop(id)}>{meta.status === "queued" ? "✕ Bỏ khỏi hàng đợi" : "■ Dừng"}</button>
           ) : (
             <div className="replay">
               {replay ? (
@@ -306,8 +418,16 @@ export default function SessionPage({ id, onChange }) {
       <div className="session-body">
         <div className="chat" ref={chat}>
           <div className="chat-inner">
-            {items.map((s, i) => <Step key={s.id || `${s.kind}-${s.i ?? i}`} step={s} />)}
+            {(() => { let n = 0; return items.map((s, i) => <Step key={s.id || `${s.kind}-${s.i ?? i}`} step={s} n={s.kind === "tool_call" ? ++n : 0} />); })()}
+            {meta.status === "queued" && <div className="info-line">Đang chờ: một agent khác đang chạy. Phiên này sẽ tự chạy khi đến lượt.</div>}
             {meta.status === "running" && !replay && <div className="typing"><span /><span /><span /></div>}
+            {meta.kind !== "profile" && meta.status !== "running" && meta.status !== "queued"
+              && (!replay || replay.shown >= events.length) && (
+              <div className="verdict-card">
+                <div className="section-title">Kết quả chấm so với đáp án</div>
+                <Answer id={id} status={meta.status} />
+              </div>
+            )}
             <div ref={bottom} />
           </div>
         </div>
@@ -325,6 +445,10 @@ export default function SessionPage({ id, onChange }) {
                 <div className="stat"><div className="stat-label">Lời gọi công cụ</div><div className="stat-value">{callCount}</div></div>
                 <div className="stat"><div className="stat-label">Giả thuyết</div><div className="stat-value">{hyps.length}</div></div>
                 <div className="stat"><div className="stat-label">Điểm</div><div className="stat-value">{meta.score != null ? `${Math.round(meta.score * 100)}%` : "–"}</div></div>
+                <div className="desc-wide">
+                  <div className="section-title">Các bước lỗi</div>
+                  <Problems events={visible} />
+                </div>
                 <dl className="desc">
                   <dt>Phiên</dt><dd className="mono">{meta.id}</dd>
                   <dt>Hệ thống</dt><dd>{meta.system}</dd>
@@ -336,7 +460,7 @@ export default function SessionPage({ id, onChange }) {
                 </dl>
               </div>
             )}
-            {tab === "hyp" && (hyps.length ? <HypothesisTable hyps={hyps} /> : <div className="muted">Agent chưa nêu giả thuyết nào.</div>)}
+            {tab === "hyp" && (hyps.length ? <HypothesisCards hyps={hyps} events={visible} /> : <div className="muted">Agent chưa nêu giả thuyết nào.</div>)}
             {tab === "timeline" && <Timeline events={visible} />}
             {tab === "sources" && <Sources events={visible} />}
             {tab === "answer" && <Answer id={id} status={meta.status} />}

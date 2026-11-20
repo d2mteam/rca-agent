@@ -26,14 +26,17 @@ DEFAULT_WINDOWS = {
 
 PROMPT = """You are surveying a software system before anyone investigates incidents in it. Your job is to learn how the system looks when it is healthy and write a factual profile that later investigators will read first.
 
-## Rules (strict)
-- Gather evidence ONLY through `uv run python -m rca --system {system} tool <name> <window> ...`, run from {root}, and ONLY on these healthy windows (no fault was labelled in them; brief blips may still occur):
-  {windows}
-- Do NOT use any case id ({prefix}-...). Do NOT read or grep anything under data/, runs/, profiles/, README.md, SETUP.md, docs/, tests/ or any .py source file, and do not run ad-hoc Python or SQL. Do not run `python -m rca` commands other than `tool`.
-- Write exactly one file: {out}. Edit nothing else.
+## Tools
+You have only the tools of this RCA project: question, overview, calls, series, logs, baro, exclusive, traces and onset,
+which take a `window`, and write_profile. Use them ONLY on these healthy windows (no fault was labelled in them; brief
+blips may still occur): {windows}
+Every investigation tool also takes optional filter, head and tail to return only part of its output. You can call
+several tools in one turn, and batch runs several of them in one call and returns all their outputs: use either for
+calls that do not depend on each other.
+Write the profile once, with write_profile.
 
 ## Start
-Run `uv run python -m rca --system {system} tool question {first}` to see the tools and the component list. Then explore however you see fit, across several of the windows (they differ in time of day and load). Budget: about 40–60 tool calls.
+Call `question` on {first} to see the tools and the component list. Then explore however you see fit, across several of the windows (they differ in time of day and load). Budget: about 40–60 tool calls.
 
 ## What the profile must contain
 Facts about the system only, each backed by what you observed (name the tool and window, give the numbers). Cover at least:
@@ -46,16 +49,7 @@ Facts about the system only, each backed by what you observed (name the tool and
 Do NOT write rules about which fault causes which symptom, and do not guess at fault types; the profile describes the healthy system only. Keep it compact: at most about 150 lines of Markdown.
 
 ## Final report
-Reply with the file path, the number of tool calls you used, and 3–5 lines on what surprised you."""
-
-# Added only when the user picks Vietnamese in Settings.
-VIETNAMESE = """
-
-## Language
-Think, reason and write the profile in Vietnamese, and write your notes and final report in Vietnamese too. Keep in
-their original form: proper names, technical terms (for example CPU, latency, packet loss, exclusive time, trace,
-span, change point), component names, KPI and metric names, tool names, commands, numbers and units."""
-
+Reply with the number of tool calls you used and 3–5 lines on what surprised you."""
 
 def name(system: str) -> str:
     return system.lower()
@@ -103,11 +97,29 @@ def check(chosen: list[str], cases) -> None:
             raise ValueError(f"{w} lies within an hour of a query window")
 
 
-def instructions(system: str, chosen: list[str], cases, language: str = "en") -> tuple[str, Path]:
+def instructions(system: str, chosen: list[str], cases) -> tuple[str, Path]:
+    """Instructions to survey the healthy windows and write the English profile (a Vietnamese one is translated)."""
     if not chosen:
         raise ValueError(f"no healthy window given for {system}")
     check(chosen, cases)
-    out = path(system, language)
-    text = PROMPT.format(system=system, root=ROOT, windows=", ".join(chosen), prefix=systems.get(system).case_prefix,
-                         out=out, first=chosen[0])
-    return text + (VIETNAMESE if language == "vi" else ""), out
+    return PROMPT.format(windows=", ".join(chosen), first=chosen[0]), path(system)
+
+
+TRANSLATE = """Translate the system profile into Vietnamese.
+
+- You have two tools: read_profile returns the English profile, write_profile saves your translation. Call
+  read_profile, translate, then call write_profile once with the whole translation.
+- Translate faithfully. Do not add, drop, merge or reinterpret any fact, number or caveat; keep the order of sections
+  and items.
+- Keep the Markdown structure as it is: headings, lists, tables (translate the cell text, keep the columns).
+- Keep in their original form: proper names, technical terms (for example CPU, latency, packet loss, exclusive time,
+  trace, span, change point, IQR), component names, KPI and metric names, tool names, window names
+  (normal-YYYY_MM_DD-HHMM), code spans, numbers and units."""
+
+
+def translation(system: str) -> tuple[str, Path, Path]:
+    """Instructions to translate the English profile into Vietnamese, its source and its target."""
+    src, dst = path(system, "en"), path(system, "vi")
+    if not src.exists():
+        raise ValueError(f"{src.relative_to(ROOT)} does not exist: write the English profile first")
+    return TRANSLATE, src, dst

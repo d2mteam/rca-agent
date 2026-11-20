@@ -12,6 +12,7 @@ An event is a dict with a `kind`:
 """
 
 import re
+import shlex
 from datetime import datetime
 
 RCA_TOOL = re.compile(r"rca tool\s+(?:--protocol\s+\S+\s+)?([a-z]+)\s+(\S+)((?:\s+(?![;&|])[^;&|\n]+)?)")
@@ -30,9 +31,45 @@ def expand(command: str) -> str:
     return command
 
 
+def _words(statement: str) -> list[list[str]]:
+    """The simple commands of a shell text as word lists, quotes respected (a ; inside --evidence "..." stays)."""
+    lex = shlex.shlex(statement, posix=True, punctuation_chars=";&|<>()")
+    lex.whitespace_split = True
+    commands, current = [], []
+    for tok in lex:
+        if tok and set(tok) <= set(";&|<>()"):
+            if current:
+                commands.append(current)
+            current = []
+        else:
+            current.append(tok)
+    if current:
+        commands.append(current)
+    return commands
+
+
 def rca_calls(command: str) -> list[dict]:
-    """The `rca tool` invocations inside a shell command: tool, case and the remaining arguments."""
-    return [{"tool": m[1], "case": m[2], "args": m[3].strip()} for m in RCA_TOOL.finditer(expand(command or ""))]
+    """The `rca tool` invocations inside a shell command: tool, case and the remaining arguments (`argv`, and `args`
+    joined back into one string)."""
+    calls = []
+    # A backslash at the end of a line continues the command on the next one.
+    for line in re.sub(r"\\\n", " ", expand(command or "")).split("\n"):
+        try:
+            commands = _words(line)
+        except ValueError:  # unbalanced quotes: fall back to the plain pattern
+            commands = []
+            for m in RCA_TOOL.finditer(line):
+                calls.append({"tool": m[1], "case": m[2], "args": m[3].strip(), "argv": m[3].split()})
+        for words in commands:
+            for i in range(len(words) - 1):
+                if words[i] == "rca" and words[i + 1] == "tool":
+                    rest = words[i + 2:]
+                    while rest[:1] == ["--protocol"]:
+                        rest = rest[2:]
+                    if len(rest) >= 2:
+                        calls.append({"tool": rest[0], "case": rest[1], "args": shlex.join(rest[2:]), "argv": rest[2:]})
+                    break
+    return calls
 
 
 def parse_hypotheses(text: str) -> list[dict]:
@@ -53,6 +90,16 @@ def parse_hypotheses(text: str) -> list[dict]:
             elif s.startswith("evidence:"):
                 current["evidence"].append(s[len("evidence:"):].strip())
     return found
+
+
+def tool_call_event(call_id: str, name: str, args: dict) -> dict:
+    """A UI event for a call to one of the rca tools (from the MCP server or the API backend)."""
+    from rca.ui import toolspec
+
+    name = name.removeprefix("mcp__rca__")
+    shown = ", ".join(f"{k}={v!r}" for k, v in args.items())
+    return {"kind": "tool_call", "id": call_id, "name": name, "command": f"{name}({shown})", "input": args,
+            "rca": toolspec.ui_call(name, args)}
 
 
 def _text(content) -> str:
@@ -94,7 +141,9 @@ def normalise(line: dict) -> list[dict]:
                     out.append({"kind": "thinking", "text": block["thinking"]})
                 elif b == "text" and block.get("text", "").strip():
                     out.append({"kind": "prompt" if kind == "user" else "text", "text": block["text"]})
-                elif b == "tool_use":
+                elif b == "tool_use" and str(block.get("name", "")).startswith("mcp__rca__"):
+                    out.append(tool_call_event(block.get("id"), block["name"], block.get("input") or {}))
+                elif b == "tool_use":  # transcripts of runs that used a shell
                     command = block.get("input", {}).get("command") or block.get("input", {}).get("file_path") or ""
                     out.append({"kind": "tool_call", "id": block.get("id"), "name": block.get("name"),
                                 "command": command, "rca": rca_calls(command)})

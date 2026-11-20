@@ -22,11 +22,23 @@ export default function ProfilePanel({ system, onRun }) {
   async function write() {
     setError("");
     const list = windows.split(/[\s,]+/).filter(Boolean);
-    const target = await api.profile(system, settingsLanguage);
+    const target = await api.profile(system, "en");
     if (target.exists && !window.confirm(`${target.path} đã có. Ghi đè hồ sơ này?`)) return;
     setBusy(true);
     try {
       const meta = await api.runProfile(system, backend, target.exists, list);
+      onRun();
+      window.location.hash = `#/session/${meta.id}`;
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  }
+
+  async function translate() {
+    setError("");
+    const vi = await api.profile(system, "vi");
+    if (vi.exists && !window.confirm(`${vi.path} đã có. Dịch lại và ghi đè?`)) return;
+    setBusy(true);
+    try {
+      const meta = await api.translateProfile(system, backend, vi.exists);
       onRun();
       window.location.hash = `#/session/${meta.id}`;
     } catch (e) { setError(e.message); } finally { setBusy(false); }
@@ -65,11 +77,16 @@ export default function ProfilePanel({ system, onRun }) {
                 <option value="api">Claude API (theo Cài đặt)</option>
               </select>
             </label>
-            <div className="muted small">
-              Ngôn ngữ: <b>{settingsLanguage === "vi" ? "Tiếng Việt" : "English"}</b> (đổi trong <a href="#/settings">Cài đặt</a>).
-              Hồ sơ {settingsLanguage === "vi" ? "tiếng Việt ghi vào file .vi.md riêng" : "tiếng Anh ghi vào file .md"}.
-            </div>
+            <div className="muted small">Hồ sơ luôn được viết bằng tiếng Anh, vào file .md. Bản tiếng Việt có qua nút dịch bên dưới.</div>
             <button className="btn btn-primary" disabled={busy} onClick={write}>{busy ? "Đang khởi chạy…" : "▶ Viết hồ sơ"}</button>
+          </div>
+        </div>
+        <div className="card">
+          <div className="card-head"><span>Bản tiếng Việt</span></div>
+          <div className="form">
+            <div className="muted small">Dịch hồ sơ tiếng Anh đang có sang tiếng Việt, giữ nguyên tên riêng, thuật ngữ, tên máy,
+              metric, lệnh, số liệu. Agent chỉ được đọc file .md và ghi file .vi.md, không chạy công cụ nào.</div>
+            <button className="btn" disabled={busy} onClick={translate}>文 Dịch sang tiếng Việt</button>
           </div>
         </div>
         {p && p.sessions.length > 0 && (
@@ -80,7 +97,7 @@ export default function ProfilePanel({ system, onRun }) {
               return (
                 <a key={s.id} className="list-item" href={`#/session/${s.id}`}>
                   <span className={`tag tag-${st.tone}`}>{st.label}</span>
-                  <span className="small">{clock(s.created)} · {s.language === "vi" ? "VI" : "EN"}</span>
+                  <span className="small">{clock(s.created)} · {s.mode === "translate" ? "dịch → VI" : s.language === "vi" ? "VI" : "EN"}</span>
                 </a>
               );
             })}

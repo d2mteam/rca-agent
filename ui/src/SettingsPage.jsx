@@ -91,16 +91,13 @@ export default function SettingsPage() {
           <div className="form">
             <label className="check"><input type="checkbox" checked={s.use_profile} onChange={set("use_profile")} />
               Cho agent đọc hồ sơ hệ thống (profiles/) khi hệ đó có hồ sơ</label>
-            <label>Ngôn ngữ giải thích và suy luận
+            <label>Báo cáo cuối
               <select className="input" value={s.language} onChange={set("language")}>
-                <option value="en">English — lời dặn giữ nguyên như các thí nghiệm</option>
-                <option value="vi">Tiếng Việt — giữ nguyên tên riêng, thuật ngữ, tên máy, metric, lệnh</option>
+                <option value="en">English</option>
+                <option value="vi">English + bản tiếng Việt</option>
               </select>
             </label>
-            {s.language === "vi" && (
-              <div className="muted small">Thêm một đoạn vào cuối lời dặn. Tên máy và lý do khi ghi giả thuyết và nộp đáp án
-                vẫn là chuỗi tiếng Anh trong danh sách. Kết quả chạy bằng tiếng Việt chưa được đo so với tiếng Anh.</div>
-            )}
+            <div className="muted small">Agent luôn điều tra bằng tiếng Anh. Khi chọn thêm tiếng Việt, báo cáo cuối có thêm bản tiếng Việt.</div>
           </div>
         </div>
         <button className="btn btn-primary" onClick={save}>Lưu cài đặt</button>

@@ -1,17 +1,16 @@
-"""Run one agent on one case, writing UI events as it goes.
+"""Run one agent on one task (a case, a profile survey or a profile translation), writing UI events as it goes.
 
-Two backends share the same instructions and the same blind-test rules:
-- claude_code: the `claude` CLI installed on this machine, in print mode with stream-json output. Its
-  permissions allow only `uv run python -m rca tool ...` and reading the system profile; user and project
-  settings are not loaded, so no broader rule from them applies.
-- api: the Anthropic SDK's tool runner against the configured provider (Anthropic or an Anthropic-compatible base
-  URL), with the same two abilities: a shell that runs only `uv run python -m rca tool ...` and a reader that opens
-  only the system profile.
+The agent gets the project's investigation tools and nothing else: no shell, no file access. The tools are defined
+once in rca.ui.toolspec and offered in two ways:
+- claude_code: the `claude` CLI installed on this machine, in print mode with stream-json output, with every built-in
+  tool turned off (--tools "") and the rca tools served by rca.ui.mcp_tools (--mcp-config, --strict-mcp-config);
+  user and project settings are not loaded.
+- api: the Anthropic SDK against the configured provider (Anthropic or an Anthropic-compatible base URL), a tool-use
+  loop over the same tools.
 """
 
 import json
 import os
-import shlex
 import subprocess
 import sys
 import threading
@@ -20,75 +19,86 @@ from pathlib import Path
 
 from rca.ui import events as ev
 from rca.ui import settings as cfg
+from rca.ui import toolspec
 
 ROOT = Path(__file__).resolve().parents[2]
-OUTPUT_LIMIT = 40_000
 
-# The instructions of the project's blind-test runs, for one case.
+# The project's blind-test instructions for one case, with the shell commands replaced by the tools the agent gets.
 RULES = """You are doing root-cause analysis (RCA) on an incident of a system. Solve this one case on your own: {case}.
 
-## Rules (blind test, strict)
-{profile_rule}- Apart from that, gather evidence ONLY through `uv run python -m rca tool <name> ...`, run from {root}.
-- Do NOT read or grep anything under data/ (no CSV or Parquet), runs/, profiles/ (other than the file above), README.md,
-  SETUP.md, docs/, tests/ or any .py source file. Do NOT run `python -m rca cases`, `python -m rca score` or
-  `python -m rca baseline`, and do not run ad-hoc Python or SQL against the data. Those reveal the answers or skip the
-  reasoning this test measures.
-- Do not edit any files.
-
+## Tools
+You have only the tools of this RCA project: question, overview, calls, series, logs, baro, exclusive, traces, onset,
+hypothesis_add, hypothesis_test, hypothesis_list and submit{read_tool}. They all work on case {case}; you do not pass
+the case id. Every investigation tool also takes optional filter, head and tail to return only part of its output.
+You can call several tools in one turn, and batch runs several of them in one call and returns all their outputs:
+use either for calls that do not depend on each other.
+{profile_rule}
 ## How to work
-Start with `uv run python -m rca tool question {case}`: it prints the query, the time window, the components and
-reasons you must answer with, the available tools and how to submit. Investigate with the tools as you see fit; how you
-read the data is up to you. Follow the hypothesis protocol the question describes: state competing hypotheses with what
-you expect to see if each is true or false, test them, and record the outcome.
+Start with `question`: it prints the query, the time window and the components and reasons you must answer with.
+Then reason about the system as an experienced backend engineer would, and use the tools when you need data to settle
+a question you have. Before a tool call, say what you want to find out and why; after it, say what the result means
+for the system before you decide the next step. You do not have to call a tool every turn: when what you have seen is
+enough to think further or to answer, think or answer. Statistical rankings and labels from the tools are hints, not
+conclusions: judge yourself whether what they point at could really be the fault.
+hypothesis_add, hypothesis_test and hypothesis_list record candidate causes if you find that useful; they are not
+required.
 The fault time is graded within ±60 seconds of when the root cause started. Component and reason must be exact strings
 from the lists the question prints.
-Always add `--run {run}` to every hypothesis and submit command. Submit one answer per failure (`--append` for the
-second and later failures of a multi-failure query; a submit without --append replaces earlier answers for that case).
-Always submit time, component and reason even if only some are asked. Budget: about 15–25 tool commands. Never leave
-the case without a submission.
+Submit one answer per failure with submit (append=true for the second and later failures of a multi-failure query;
+without it a submit replaces earlier answers). Always submit time, component and reason even if only some are asked.
+Never leave the case without a submission.
 
 ## Final report
-Give: the submitted answer; the hypotheses you tested and why each was supported or refuted (one line each); whether the
-profile changed a decision; and your confidence (low/med/high). Keep it compact."""
+Give: the submitted answer; the causes you considered and why you kept or dropped each; whether the profile changed a
+decision; and your confidence (low/med/high)."""
+
+# A reader watching the session needs the hypotheses and the evidence written out in full.
+WRITING = """## How to write (read this first)
+Write your reasoning in full sentences that a reader who does not see the tool output can follow: say what you saw and
+what you conclude, without telegraphic notes, shorthand, or arrows and abbreviations you do not explain. Use what you
+have already observed; do not run extra tools only to have more to write. If you use the hypothesis tools, write
+if_true, if_false and the evidence the same way. In the final report, explain each cause you considered and why you
+kept or dropped it the same way.
+
+"""
+
+# Added only when the user picks Vietnamese: the investigation stays in English, the closing report gets a Vietnamese
+# version as well.
+VIETNAMESE_REPORT = """
+After the final report, give the same report again in Vietnamese. Keep component, reason, metric and tool names and
+numbers as they are."""
 
 
-# Added to the instructions only when the user picks Vietnamese in Settings; the default runs them unchanged.
-VIETNAMESE = """
-
-## Language
-Think and reason in Vietnamese, and write your explanations in Vietnamese: what you write between tool commands, the
---if-true, --if-false and --evidence text of your hypotheses, and the final report. Keep in their original form: proper names, technical
-terms (for example CPU, latency, packet loss, exclusive time, trace, span, change point), component names, KPI and
-metric names, tool names, commands and tool output. The --component and --reason you pass to `hypothesis add` and
-`submit` must stay the exact strings from the lists the question prints."""
-
-
-def profile_path(system: str, language: str = "en") -> Path | None:
-    """The profile the agent reads: the Vietnamese one when chosen and written, else the English one."""
+def profile_path(system: str) -> Path | None:
+    """The profile the agent reads: the English one (the Vietnamese translation is for people reading the UI)."""
     from rca.ui import profiles
 
-    for path in ([profiles.path(system, "vi")] if language == "vi" else []) + [profiles.path(system)]:
-        if path.exists():
-            return path
-    return None
+    path = profiles.path(system)
+    return path if path.exists() else None
 
 
-def instructions(case: str, system: str, run: str, use_profile: bool, language: str = "en") -> str:
-    profile = profile_path(system, language) if use_profile else None
-    rule = (f"- First read {profile}: a profile of this system written from healthy periods (no faults). It describes\n"
-            "  topology, which data each component has, normal levels and what the statistical tools report as noise\n"
-            "  when nothing is wrong. Use it as background.\n") if profile else "- There is no system profile for this system.\n"
-    return RULES.format(case=case, run=run, root=ROOT, profile_rule=rule) + (VIETNAMESE if language == "vi" else "")
+def instructions(case: str, system: str, use_profile: bool, language: str = "en") -> str:
+    profile = profile_path(system) if use_profile else None
+    rule = ("First call read_profile: a profile of this system written from healthy periods (no faults). It describes\n"
+            "topology, which data each component has, normal levels and what the statistical tools report as noise when\n"
+            "nothing is wrong. Use it as background.\n") if profile else "There is no system profile for this system.\n"
+    text = RULES.format(case=case, profile_rule=rule, read_tool=", and read_profile" if profile else "")
+    # The writing section goes right after the opening line, where it is not missed.
+    first, rest = text.split("\n\n", 1)
+    return f"{first}\n\n{WRITING}{rest}" + (VIETNAMESE_REPORT if language == "vi" else "")
+
+
+def case_task(case: str, system: str, run: str, use_profile: bool, language: str = "en") -> dict:
+    profile = profile_path(system) if use_profile else None
+    return {"mode": "case", "system": system, "case": case, "run": run, "read": str(profile or ""), "write": ""}
 
 
 class Run(threading.Thread):
     """One agent run; `emit` receives every UI event, `finish` the final status."""
 
-    def __init__(self, backend: str, case: str, system: str, run: str, emit, finish, profile_task=None):
+    def __init__(self, backend: str, task: dict, prompt: str, emit, finish):
         super().__init__(daemon=True)
-        self.backend, self.case, self.system, self.run_name = backend, case, system, run
-        # (instructions, output path) when this run writes a system profile instead of solving a case.
-        self.profile_task = profile_task
+        self.backend, self.task, self.prompt = backend, task, prompt
         self.emit, self.finish = emit, finish
         self.stopped = threading.Event()
         self.process: subprocess.Popen | None = None
@@ -107,25 +117,28 @@ class Run(threading.Thread):
         self.finish("stopped" if self.stopped.is_set() else status)
 
     # --- claude code -------------------------------------------------------------------------------
-    def _claude_code(self) -> str:
-        s = cfg.load()
-        if self.profile_task:
-            prompt, out = self.profile_task
-            allowed = [f"Bash(uv run python -m rca --system {self.system} tool:*)", f"Write(//{str(out).lstrip('/')})"]
-        else:
-            prompt = instructions(self.case, self.system, self.run_name, s["use_profile"], s["language"])
-            allowed = ["Bash(uv run python -m rca tool:*)"]
-            profile = profile_path(self.system, s["language"]) if s["use_profile"] else None
-            if profile:
-                allowed.append(f"Read(//{str(profile).lstrip('/')})")
-        env = {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")} | cfg.claude_env(s)
-        model = s["model"] if s["claude_code_use_provider"] and s["model"].strip() else s["claude_code_model"]
-        command = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", model,
+    def command(self, settings: dict) -> tuple[list[str], dict]:
+        """The claude command line and environment for this run."""
+        model = (settings["model"] if settings["claude_code_use_provider"] and settings["model"].strip()
+                 else settings["claude_code_model"])
+        server = {"type": "stdio", "command": sys.executable, "args": ["-m", "rca.ui.mcp_tools"],
+                  "env": {"RCA_UI_TASK": json.dumps(self.task), "PYTHONPATH": str(ROOT)}}
+        command = ["claude", "-p", self.prompt, "--output-format", "stream-json", "--verbose", "--model", model,
                    "--permission-mode", "dontAsk", "--setting-sources", "", "--no-session-persistence",
-                   "--allowedTools", *allowed]
-        self.emit({"kind": "prompt", "text": prompt})
-        self.emit({"kind": "info", "model": model, "backend": "claude_code",
-                   "command": " ".join(shlex.quote(c) if c != prompt else "<prompt>" for c in command)})
+                   "--tools", "", "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {"rca": server}}),
+                   "--allowedTools", "mcp__rca"]
+        # Keep the login (CLAUDE_CONFIG_DIR) but drop API credentials and the variables of any Claude Code session the
+        # server itself was started from, so each run is its own session.
+        own = {k: v for k, v in os.environ.items()
+               if not k.startswith(("ANTHROPIC_", "CLAUDE_CODE_", "CLAUDE_AGENT_SDK")) and k not in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")}
+        env = own | cfg.claude_env(settings) | {
+            "MCP_TOOL_TIMEOUT": "600000",  # a tool can be slow on a busy machine
+        }
+        return command, env
+
+    def _claude_code(self) -> str:
+        command, env = self.command(cfg.load())
+        self.emit({"kind": "prompt", "text": self.prompt})
         self.process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         text=True, bufsize=1)
         started, status = {}, "finished"
@@ -143,7 +156,6 @@ class Run(threading.Thread):
                     started[e["id"]] = time.time()
                 if e["kind"] == "tool_result" and e["id"] in started:
                     e["ms"] = int(1000 * (time.time() - started.pop(e["id"])))
-                    e["output"] = e["output"][:OUTPUT_LIMIT]
                 if e["kind"] == "done":
                     status = e["status"]
                 self.emit(e)
@@ -157,67 +169,14 @@ class Run(threading.Thread):
     # --- api ----------------------------------------------------------------------------------------
     def _api(self) -> str:
         import anthropic
-        from anthropic import beta_tool
 
         s = cfg.load()
         if not s["model"].strip():
             raise ValueError("no model configured: open Settings")
         credentials = {"auth_token" if s["auth"] == "auth_token" else "api_key": s["api_key"]} if s["api_key"] else {}
         client = anthropic.Anthropic(base_url=s["base_url"].strip() or None, **credentials)
-        if self.profile_task:
-            prompt, out = self.profile_task
-            profile = None
-        else:
-            prompt = instructions(self.case, self.system, self.run_name, s["use_profile"], s["language"])
-            profile = profile_path(self.system, s["language"]) if s["use_profile"] else None
-            out = None
-
-        @beta_tool
-        def bash(command: str) -> str:
-            """Run a shell command from the repository root and return its output. Only
-            `uv run python -m rca tool <name> ...` commands are allowed.
-
-            Args:
-                command: The command to run.
-            """
-            return self._run_command(command)
-
-        @beta_tool
-        def read(file_path: str) -> str:
-            """Read a text file.
-
-            Args:
-                file_path: Absolute path of the file.
-            """
-            call_id = f"call-{time.time_ns()}"
-            self.emit({"kind": "tool_call", "id": call_id, "name": "Read", "command": file_path, "rca": []})
-            ok = profile is not None and Path(file_path).resolve() == profile
-            text = profile.read_text() if ok else "Permission denied: only the system profile can be read."
-            self.emit({"kind": "tool_result", "id": call_id, "output": text, "is_error": not ok, "ms": 0})
-            return text
-
-        @beta_tool
-        def write(file_path: str, content: str) -> str:
-            """Write a text file, replacing it if it exists.
-
-            Args:
-                file_path: Absolute path of the file.
-                content: The full content to write.
-            """
-            call_id = f"call-{time.time_ns()}"
-            self.emit({"kind": "tool_call", "id": call_id, "name": "Write", "command": file_path, "rca": []})
-            ok = out is not None and Path(file_path).resolve() == out
-            if ok:
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(content)
-            text = f"wrote {len(content)} characters to {out}" if ok else "Permission denied: only the profile file can be written."
-            self.emit({"kind": "tool_result", "id": call_id, "output": text, "is_error": not ok, "ms": 0})
-            return text
-
-        tools = [bash, write] if out else [bash, read] if profile else [bash]
-        params = {"model": s["model"].strip(), "max_tokens": 16000, "max_iterations": int(s["max_iterations"]),
-                  "tools": tools,
-                  "messages": [{"role": "user", "content": prompt}]}
+        tools = toolspec.definitions(self.task)
+        params = {"model": s["model"].strip(), "max_tokens": 16000, "tools": tools}
         if cfg.official(s):
             params["thinking"] = {"type": "adaptive", "display": "summarized"} if s["thinking"] else {"type": "adaptive"}
             params["output_config"] = {"effort": s["effort"]}
@@ -227,56 +186,43 @@ class Run(threading.Thread):
                 params["fallbacks"] = "default"
         elif s["thinking"]:
             params["thinking"] = {"type": "adaptive", "display": "summarized"}
-        self.emit({"kind": "prompt", "text": prompt})
+        self.emit({"kind": "prompt", "text": self.prompt})
         self.emit({"kind": "info", "model": params["model"], "backend": "api",
-                   "base_url": s["base_url"].strip() or "https://api.anthropic.com"})
+                   "base_url": s["base_url"].strip() or "https://api.anthropic.com", "tools": [t["name"] for t in tools]})
+        messages = [{"role": "user", "content": self.prompt}]
         usage = {"input_tokens": 0, "output_tokens": 0}
-        started, turns = time.time(), 0
-        runner = client.beta.messages.tool_runner(**params)
-        status = "finished"
-        for message in runner:
-            turns += 1
-            for block in message.content:
+        started, status = time.time(), "finished"
+        for turn in range(int(s["max_iterations"])):
+            if self.stopped.is_set():
+                break
+            response = client.beta.messages.create(**params, messages=messages)
+            if response.usage:
+                usage["input_tokens"] += response.usage.input_tokens or 0
+                usage["output_tokens"] += response.usage.output_tokens or 0
+            for block in response.content:
                 if block.type == "thinking" and (block.thinking or "").strip():
                     self.emit({"kind": "thinking", "text": block.thinking})
                 elif block.type == "text" and block.text.strip():
                     self.emit({"kind": "text", "text": block.text})
-            if message.usage:
-                usage["input_tokens"] += message.usage.input_tokens or 0
-                usage["output_tokens"] += message.usage.output_tokens or 0
-            if message.stop_reason == "refusal":
+            if response.stop_reason == "refusal":
                 self.emit({"kind": "error", "text": "the model declined the request (stop_reason: refusal)"})
                 status = "error"
                 break
-            if self.stopped.is_set():
+            messages.append({"role": "assistant", "content": response.content})  # thinking blocks passed back unchanged
+            if response.stop_reason == "pause_turn":
+                continue
+            calls = [b for b in response.content if b.type == "tool_use"]
+            if not calls:
                 break
+            results = []
+            for block in calls:
+                self.emit(ev.tool_call_event(block.id, block.name, dict(block.input)))
+                t0 = time.time()
+                output, is_error = toolspec.call(self.task, block.name, dict(block.input))
+                self.emit({"kind": "tool_result", "id": block.id, "output": output, "is_error": is_error,
+                           "ms": int(1000 * (time.time() - t0))})
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output, "is_error": is_error})
+            messages.append({"role": "user", "content": results})
         self.emit({"kind": "done", "status": status, "duration_ms": int(1000 * (time.time() - started)),
-                   "turns": turns, "usage": usage})
+                   "turns": turn + 1, "usage": usage})
         return status
-
-    def _run_command(self, command: str) -> str:
-        call_id = f"call-{time.time_ns()}"
-        self.emit({"kind": "tool_call", "id": call_id, "name": "Bash", "command": command, "rca": ev.rca_calls(command)})
-        started = time.time()
-        output, is_error = self._execute(command)
-        self.emit({"kind": "tool_result", "id": call_id, "output": output[:OUTPUT_LIMIT], "is_error": is_error,
-                   "ms": int(1000 * (time.time() - started))})
-        return output[:OUTPUT_LIMIT]
-
-    def _execute(self, command: str) -> tuple[str, bool]:
-        """Run `uv run python -m rca tool ...` and nothing else, the rule the Claude Code backend gets."""
-        if self.stopped.is_set():
-            return "the run was stopped", True
-        try:
-            args = shlex.split(command)
-        except ValueError as e:
-            return f"cannot parse the command: {e}", True
-        rest = args[5:]
-        if rest[:2] == ["--system", self.system]:
-            rest = rest[2:]
-        if args[:5] != ["uv", "run", "python", "-m", "rca"] or rest[:1] != ["tool"] or any(
-                ch in command for ch in ";&|`$<>\n"):
-            return "Permission denied: only `uv run python -m rca tool <name> ...` commands are allowed.", True
-        result = subprocess.run([sys.executable, "-m", "rca", *args[5:]], cwd=ROOT, capture_output=True, text=True,
-                                timeout=600)
-        return (result.stdout + result.stderr).strip() or "(no output)", result.returncode != 0

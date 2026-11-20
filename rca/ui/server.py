@@ -18,7 +18,7 @@ from rca.cases import CST, load_cases
 from rca.scoring import load_predictions, score_case
 from rca.ui import settings as cfg
 from rca.ui import profiles
-from rca.ui.agents import Run, profile_path
+from rca.ui.agents import Run, case_task, instructions, profile_path
 from rca.ui.sessions import Store
 
 STATIC = Path(__file__).parent / "static"
@@ -28,11 +28,15 @@ class App:
     def __init__(self, data: Path, runs: Path):
         self.data, self.runs = data, runs
         self.store = Store(runs)
+        # One agent at a time: each run takes every core for its tool commands, so parallel runs only slow each
+        # other down (and push commands past their timeout). Later runs wait in `queue`.
         self.active: dict[str, Run] = {}
+        self.queue: list[tuple[str, Run]] = []
+        self.lock = threading.Lock()
         self._cases: dict[str, list] = {}
         for meta in self.store.list():
             # A run that was live when the server stopped can no longer finish.
-            if meta.get("status") == "running":
+            if meta.get("status") in ("running", "queued"):
                 self.store.update(meta["id"], status="interrupted")
             # Imported sessions get their score once.
             elif "score" not in meta:
@@ -80,7 +84,7 @@ class App:
             raise ValueError(f"no case {case_id} in {system}")
         s = cfg.load()
         model = s["model"] if backend == "api" or s["claude_code_use_provider"] else s["claude_code_model"]
-        meta = self.store.create(case=case_id, system=system, backend=backend, model=model,
+        meta = self.store.create(case=case_id, system=system, backend=backend, model=model, status="queued",
                                  base_url=s["base_url"] if backend == "api" or s["claude_code_use_provider"] else "",
                                  profile=bool(s["use_profile"] and profile_path(system)), language=s["language"])
         session_id = meta["id"]
@@ -89,12 +93,44 @@ class App:
 
         def finish(status: str):
             self.store.update(session_id, status=status, finished=time.time(), score=self.score(session_id))
-            self.active.pop(session_id, None)
+            self._done(session_id)
 
-        run = Run(backend, case_id, system, meta["run"], lambda e: self.store.append(session_id, e), finish)
-        self.active[session_id] = run
+        task = case_task(case_id, system, meta["run"], s["use_profile"], s["language"])
+        prompt = instructions(case_id, system, s["use_profile"], s["language"])
+        run = Run(backend, task, prompt, lambda e: self.store.append(session_id, e), finish)
+        return self._enqueue(session_id, run)
+
+    def _enqueue(self, session_id: str, run: Run) -> dict:
+        with self.lock:
+            self.queue.append((session_id, run))
+        self._dispatch()
+        return self.store.meta(session_id)
+
+    def _dispatch(self) -> None:
+        with self.lock:
+            if self.active or not self.queue:
+                return
+            session_id, run = self.queue.pop(0)
+            self.active[session_id] = run
+        self.store.update(session_id, status="running", started=time.time())
         run.start()
-        return meta
+
+    def _done(self, session_id: str) -> None:
+        with self.lock:
+            self.active.pop(session_id, None)
+        self._dispatch()
+
+    def stop(self, session_id: str) -> bool:
+        with self.lock:
+            run = self.active.get(session_id)
+            queued = next((r for s, r in self.queue if s == session_id), None)
+            if queued:
+                self.queue = [(s, r) for s, r in self.queue if s != session_id]
+        if run:
+            run.stop()
+        if queued:
+            self.store.update(session_id, status="stopped", finished=time.time())
+        return bool(run or queued)
 
     def profile_windows(self, system: str) -> tuple[list[str], list[str]]:
         """The windows set for a system (or the suggestion when none is set) and the suggestion itself."""
@@ -109,26 +145,66 @@ class App:
             cfg.save({"profile_windows": {**cfg.load()["profile_windows"], system: chosen}})
         chosen = self.profile_windows(system)[0]
         s = cfg.load()
-        prompt, out = profiles.instructions(system, chosen, self.cases(system), s["language"])
+        prompt, out = profiles.instructions(system, chosen, self.cases(system))
         if out.exists() and not overwrite:
             raise ValueError(f"{out.relative_to(profiles.ROOT)} already exists")
+        busy = [m for m in self.store.list() if m.get("kind") == "profile" and m["system"] == system
+                and m.get("status") in ("running", "queued")]
+        if busy:
+            raise ValueError(f"a profile of {system} is already being written: session {busy[0]['id']}")
         model = s["model"] if backend == "api" or s["claude_code_use_provider"] else s["claude_code_model"]
         meta = self.store.create(case=f"{system.lower()}-profile", system=system, backend=backend, model=model,
-                                 kind="profile", output=str(out), windows=chosen, language=s["language"],
+                                 kind="profile", status="queued", output=str(out), windows=chosen, language="en",
                                  base_url=s["base_url"] if backend == "api" or s["claude_code_use_provider"] else "")
         session_id = meta["id"]
         self.store.append(session_id, {"kind": "question", "text": f"Viết hồ sơ hệ thống {system} từ các cửa sổ khỏe: "
                                        + ", ".join(chosen), "asks": []})
 
-        def finish(status: str):
-            self.store.update(session_id, status=status, finished=time.time())
-            self.active.pop(session_id, None)
+        before = out.stat().st_mtime if out.exists() else None
 
-        run = Run(backend, meta["case"], system, meta["run"], lambda e: self.store.append(session_id, e), finish,
-                  profile_task=(prompt, out))
-        self.active[session_id] = run
-        run.start()
-        return meta
+        def finish(status: str):
+            # A run that ends without writing the profile failed, whatever the agent said.
+            if status == "finished" and (not out.exists() or out.stat().st_mtime == before):
+                self.store.append(session_id, {"kind": "error", "text": f"the agent ended without writing {out}"})
+                status = "error"
+            self.store.update(session_id, status=status, finished=time.time())
+            self._done(session_id)
+
+        task = {"mode": "profile", "system": system, "windows": chosen, "read": "", "write": str(out)}
+        run = Run(backend, task, prompt, lambda e: self.store.append(session_id, e), finish)
+        return self._enqueue(session_id, run)
+
+    def start_translation(self, system: str, backend: str, overwrite: bool) -> dict:
+        """Translate the English profile into profiles/<system>.vi.md, with Read and Write only."""
+        if backend not in ("claude_code", "api"):
+            raise ValueError(f"unknown backend {backend!r}")
+        prompt, src, out = profiles.translation(system)
+        if out.exists() and not overwrite:
+            raise ValueError(f"{out.relative_to(profiles.ROOT)} already exists")
+        busy = [m for m in self.store.list() if m.get("kind") == "profile" and m["system"] == system
+                and m.get("status") in ("running", "queued")]
+        if busy:
+            raise ValueError(f"a profile of {system} is already being written: session {busy[0]['id']}")
+        s = cfg.load()
+        model = s["model"] if backend == "api" or s["claude_code_use_provider"] else s["claude_code_model"]
+        meta = self.store.create(case=f"{system.lower()}-profile", system=system, backend=backend, model=model,
+                                 kind="profile", mode="translate", status="queued", output=str(out), source=str(src),
+                                 language="vi", base_url=s["base_url"] if backend == "api" or s["claude_code_use_provider"] else "")
+        session_id = meta["id"]
+        self.store.append(session_id, {"kind": "question", "text": f"Dịch hồ sơ {src.name} sang tiếng Việt: {out.name}",
+                                       "asks": []})
+        before = out.stat().st_mtime if out.exists() else None
+
+        def finish(status: str):
+            if status == "finished" and (not out.exists() or out.stat().st_mtime == before):
+                self.store.append(session_id, {"kind": "error", "text": f"the agent ended without writing {out}"})
+                status = "error"
+            self.store.update(session_id, status=status, finished=time.time())
+            self._done(session_id)
+
+        task = {"mode": "translate", "system": system, "read": str(src), "write": str(out)}
+        run = Run(backend, task, prompt, lambda e: self.store.append(session_id, e), finish)
+        return self._enqueue(session_id, run)
 
     def score(self, session_id: str) -> float | None:
         result = self.answer(session_id)
@@ -149,6 +225,16 @@ class App:
                 "truth": [{"time": fmt(f.time), "component": f.component, "reason": f.reason} for f in case.faults],
                 "answers": [a.__dict__ for a in answers],
                 "fields": [f.__dict__ for f in result.fields]}
+
+
+def enrich(events: list[dict]) -> list[dict]:
+    """Recompute the rca calls of every shell step from its command, so sessions saved before the parser got
+    better read the same as new ones."""
+    from rca.ui.events import rca_calls
+    for e in events:
+        if e.get("kind") == "tool_call" and e.get("name") in ("Bash", "rca_tool"):
+            e["rca"] = rca_calls(e.get("command", ""))
+    return events
 
 
 def handler(app: App):
@@ -189,14 +275,17 @@ def handler(app: App):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
-            n = start
+            n, status = start, None
             try:
                 while True:
-                    for e in app.store.events(session_id, n):
+                    for e in enrich(app.store.events(session_id, n)):
                         self.wfile.write(f"data: {json.dumps(e, ensure_ascii=False)}\n\n".encode())
                         n = e["i"] + 1
                     meta = app.store.meta(session_id) or {}
-                    if meta.get("status") != "running":
+                    if meta.get("status") != status:  # queued -> running, so the page can update its header
+                        status = meta.get("status")
+                        self.wfile.write(f"event: meta\ndata: {json.dumps(meta, ensure_ascii=False)}\n\n".encode())
+                    if meta.get("status") not in ("running", "queued"):
                         for e in app.store.events(session_id, n):
                             self.wfile.write(f"data: {json.dumps(e, ensure_ascii=False)}\n\n".encode())
                         self.wfile.write(f"event: end\ndata: {json.dumps(meta, ensure_ascii=False)}\n\n".encode())
@@ -235,11 +324,11 @@ def handler(app: App):
                     if meta is None:
                         return self._json({"error": "no such session"}, 404)
                     if len(parts) == 3:
-                        return self._json({"meta": meta, "events": app.store.events(session_id)})
+                        return self._json({"meta": meta, "events": enrich(app.store.events(session_id))})
                     if parts[3] == "stream":
                         return self._stream(session_id, int(q.get("from", 0)))
                     if parts[3] == "answer":
-                        if meta.get("status") == "running":
+                        if meta.get("status") in ("running", "queued"):
                             return self._json({"error": "the run is still going"}, 409)
                         return self._json(app.answer(session_id))
                 if url.path.startswith("/api/"):
@@ -259,14 +348,14 @@ def handler(app: App):
                     return self._json(app.start(body["system"], body["case"], body.get("backend", "claude_code")))
                 if url.path == "/api/settings":
                     return self._json(cfg.public(cfg.save(body)))
+                if url.path == "/api/profile/translate":
+                    return self._json(app.start_translation(body["system"], body.get("backend", "claude_code"),
+                                                            bool(body.get("overwrite"))))
                 if url.path == "/api/profile/run":
                     return self._json(app.start_profile(body["system"], body.get("backend", "claude_code"),
                                                         bool(body.get("overwrite")), body.get("windows")))
                 if parts[:2] == ["api", "sessions"] and len(parts) == 4 and parts[3] == "stop":
-                    run = app.active.get(parts[2])
-                    if run:
-                        run.stop()
-                    return self._json({"stopped": bool(run)})
+                    return self._json({"stopped": app.stop(parts[2])})
                 return self._json({"error": "not found"}, 404)
             except (ValueError, KeyError, SystemExit) as e:
                 return self._json({"error": str(e)}, 400)

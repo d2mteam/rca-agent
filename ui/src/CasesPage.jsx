@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "./api.js";
 import { ASKS } from "./util.js";
 import ProfilePanel from "./ProfilePanel.jsx";
+import LanguageSelect from "./LanguageSelect.jsx";
 
 export default function CasesPage({ system, view, sessions, onRun }) {
   const [systems, setSystems] = useState([]);
@@ -113,6 +114,7 @@ export default function CasesPage({ system, view, sessions, onRun }) {
               <span className="tag tag-blue mono">{selected.id}</span> {selected.instruction}
             </div>
             <div className="composer-actions">
+              <LanguageSelect />
               <select className="input" value={backend} onChange={(e) => setBackend(e.target.value)}>
                 <option value="claude_code">Claude Code trên máy này</option>
                 <option value="api">Claude API (theo Cài đặt)</option>

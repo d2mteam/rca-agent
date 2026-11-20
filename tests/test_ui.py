@@ -23,7 +23,7 @@ def test_stream_lines_become_events():
     ]
     out = [e for line in lines for e in ev.normalise(line)]
     assert [e["kind"] for e in out] == ["info", "prompt", "thinking", "text", "tool_call", "tool_result", "done"]
-    assert out[4]["rca"] == [{"tool": "question", "case": "bank-114", "args": ""}]
+    assert out[4]["rca"] == [{"tool": "question", "case": "bank-114", "args": "", "argv": []}]
     assert out[5]["output"] == "During the specified time range..."
     assert out[6]["status"] == "finished"
 
@@ -74,23 +74,14 @@ def test_settings_mask_the_key_and_map_to_claude_variables(tmp_path, monkeypatch
     assert (tmp_path / "settings.json").stat().st_mode & 0o777 == 0o600
 
 
-def test_api_backend_runs_only_rca_tool_commands():
-    from rca.ui.agents import Run
-
-    run = Run("api", "bank-114", "Bank", "ui-test", lambda e: None, lambda s: None)
-    for command in ("cat README.md", "uv run python -m rca cases", "uv run python -m rca tool question bank-114; cat x",
-                    "uv run python -m rca tool question bank-114 | head", "python -m rca tool question bank-114"):
-        output, is_error = run._execute(command)
-        assert is_error and output.startswith("Permission denied"), command
-
-
 def test_vietnamese_is_added_only_when_chosen():
-    from rca.ui.agents import instructions
+    from rca.ui.agents import VIETNAMESE_REPORT, WRITING, instructions
 
-    english = instructions("bank-114", "Bank", "ui-x", True)
-    vietnamese = instructions("bank-114", "Bank", "ui-x", True, "vi")
-    assert "Vietnamese" not in english
-    assert vietnamese.startswith(english) and "exact strings from the lists" in vietnamese[len(english):]
+    english = instructions("bank-114", "Bank", True)
+    vietnamese = instructions("bank-114", "Bank", True, "vi")
+    # The investigation stays in English; Vietnamese only adds a Vietnamese copy of the final report.
+    assert WRITING in english and english.index(WRITING) < english.index("## Tools")
+    assert VIETNAMESE_REPORT not in english and vietnamese == english + VIETNAMESE_REPORT
 
 
 def test_profile_windows_are_checked_and_written_into_the_instructions():
@@ -104,16 +95,142 @@ def test_profile_windows_are_checked_and_written_into_the_instructions():
     with pytest.raises(ValueError, match="within an hour"):
         profiles.check(["normal-2021_03_04-1530"], cases)
     english, out = profiles.instructions("Bank", ["normal-2021_03_06-0930"], cases)
-    vietnamese, out_vi = profiles.instructions("Bank", ["normal-2021_03_06-0930"], cases, "vi")
-    assert "normal-2021_03_06-0930" in english and "Vietnamese" not in english
-    assert out.name == "bank.md" and out_vi.name == "bank.vi.md"
-    # Same instructions apart from the file written and the added Language section.
-    assert vietnamese.replace("bank.vi.md", "bank.md").startswith(english) and "## Language" in vietnamese
+    assert "normal-2021_03_06-0930" in english and out.name == "bank.md"  # profiles are surveyed in English
 
 
-def test_api_shell_accepts_only_its_own_system():
-    from rca.ui.agents import Run
+def test_runs_wait_their_turn(tmp_path, monkeypatch):
+    import threading
+    from pathlib import Path
+    from rca.ui import server
 
-    run = Run("api", "telecom-profile", "Telecom", "ui-test", lambda e: None, lambda s: None)
-    output, is_error = run._execute("uv run python -m rca --system Bank tool question normal-2020_05_28-0200")
-    assert is_error and output.startswith("Permission denied")
+    release = {}
+
+    class FakeRun:
+        def __init__(self, backend, task, prompt, emit, finish):
+            self.case, self.finish, self.started = task["case"], finish, threading.Event()
+            release[self.case] = threading.Event()
+
+        def start(self):
+            self.started.set()
+            threading.Thread(target=lambda: (release[self.case].wait(5), self.finish("finished")), daemon=True).start()
+
+        def stop(self):
+            release[self.case].set()
+
+    monkeypatch.setattr(server, "Run", FakeRun)
+    app = server.App(Path("data"), tmp_path)
+    first = app.start("Bank", "bank-001", "claude_code")
+    second = app.start("Bank", "bank-002", "claude_code")
+    assert app.store.meta(first["id"])["status"] == "running"
+    assert app.store.meta(second["id"])["status"] == "queued"
+    release["bank-001"].set()
+    for _ in range(50):
+        if app.store.meta(second["id"])["status"] == "running":
+            break
+        threading.Event().wait(0.05)
+    assert app.store.meta(first["id"])["status"] == "finished"
+    assert app.store.meta(second["id"])["status"] == "running"
+    release["bank-002"].set()
+
+
+def test_rca_calls_keep_quoted_evidence_whole():
+    command = ('R="--run x"; uv run python -m rca tool hypothesis bank-114 test 1 --status supported '
+               '--evidence "gc log: 1/min; jumps to 36 | heap 41->48%" $R; uv run python -m rca tool submit --help 2>&1')
+    calls = ev.rca_calls(command)
+    assert calls[0]["tool"] == "hypothesis" and calls[0]["argv"] == [
+        "test", "1", "--status", "supported", "--evidence", "gc log: 1/min; jumps to 36 | heap 41->48%", "--run", "x"]
+    assert calls[1]["tool"] == "submit" and calls[1]["case"] == "--help"
+
+
+def test_backslash_continued_commands_are_one_command():
+    command = ('uv run python -m rca tool hypothesis bank-001 add --run x \\\n  --component MG02 --reason "network latency" \\\n'
+               '  --if-true "span duration lên 494 ms; trước Tomcat02" --if-false "bình thường"')
+    calls = ev.rca_calls(command)
+    assert len(calls) == 1 and calls[0]["argv"][calls[0]["argv"].index("--component") + 1] == "MG02"
+
+
+
+def test_the_agent_gets_only_the_project_tools():
+    from rca.ui import toolspec
+
+    case = {"mode": "case", "system": "Bank", "case": "bank-114", "run": "ui-x", "read": "/repo/profiles/bank.md", "write": ""}
+    names = [t["name"] for t in toolspec.definitions(case)]
+    assert names == ["question", "overview", "calls", "series", "logs", "baro", "exclusive", "traces", "onset",
+                     "hypothesis_add", "hypothesis_test", "hypothesis_list", "submit", "batch", "read_profile"]
+    # The case id and the run name are filled in, never typed by the agent.
+    assert toolspec.argv(case, "series", {"component": "Tomcat02", "pattern": "CPU"}) == [
+        "tool", "series", "bank-114", "Tomcat02", "CPU"]
+    assert toolspec.argv(case, "hypothesis_test", {"id": 2, "status": "refuted", "evidence": "x; y"}) == [
+        "tool", "hypothesis", "bank-114", "test", "2", "--run", "ui-x", "--status", "refuted", "--evidence", "x; y"]
+    assert toolspec.call(case, "bash", {"command": "cat README.md"}) == ("unknown tool 'bash'", True)
+    profile = {"mode": "profile", "system": "Bank", "windows": ["normal-2021_03_06-0930"], "read": "", "write": "/tmp/p.md"}
+    assert [t["name"] for t in toolspec.definitions(profile)][-2:] == ["batch", "write_profile"]
+    assert toolspec.argv(profile, "overview", {"window": "normal-2021_03_06-0930"}) == [
+        "--system", "Bank", "tool", "overview", "normal-2021_03_06-0930"]
+    assert toolspec.call(profile, "overview", {"window": "normal-2021_03_07-0930"})[1] is True  # not a given window
+    translate = {"mode": "translate", "system": "Bank", "read": "/repo/profiles/bank.md", "write": "/repo/profiles/bank.vi.md"}
+    assert [t["name"] for t in toolspec.definitions(translate)] == ["read_profile", "write_profile"]
+
+
+def test_claude_code_command_has_no_builtin_tools():
+    import json
+    from rca.ui import agents, settings
+
+    task = {"mode": "case", "system": "Bank", "case": "bank-114", "run": "ui-x", "read": "", "write": ""}
+    command, env = agents.Run("claude_code", task, "prompt", None, None).command(settings.DEFAULTS)
+    assert command[command.index("--tools") + 1] == ""
+    assert "--strict-mcp-config" in command and command[command.index("--allowedTools") + 1] == "mcp__rca"
+    server = json.loads(command[command.index("--mcp-config") + 1])["mcpServers"]["rca"]
+    assert server["args"] == ["-m", "rca.ui.mcp_tools"] and json.loads(server["env"]["RCA_UI_TASK"]) == task
+
+
+def test_mcp_server_lists_and_calls_the_tools():
+    import json, os, subprocess, sys
+    task = {"mode": "translate", "system": "Bank", "read": __file__, "write": ""}
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "read_profile", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "overview", "arguments": {}}}]
+    out = subprocess.run([sys.executable, "-m", "rca.ui.mcp_tools"], input="\n".join(json.dumps(m) for m in msgs) + "\n",
+                         capture_output=True, text=True, env={**os.environ, "RCA_UI_TASK": json.dumps(task)}, timeout=60).stdout
+    replies = {r["id"]: r for r in map(json.loads, out.splitlines())}
+    assert [t["name"] for t in replies[2]["result"]["tools"]] == ["read_profile", "write_profile"]
+    assert "test_mcp_server_lists_and_calls_the_tools" in replies[3]["result"]["content"][0]["text"]
+    assert replies[4]["result"]["isError"] is True  # a tool this task does not have
+
+
+
+def test_investigation_tools_can_return_part_of_their_output():
+    from rca.ui import toolspec
+
+    case = {"mode": "case", "system": "Bank", "case": "bank-114", "run": "ui-x", "read": "", "write": ""}
+    schema = {t["name"]: t["input_schema"]["properties"] for t in toolspec.definitions(case)}
+    assert {"filter", "head", "tail"} <= set(schema["baro"]) and "filter" not in schema["submit"]
+    text = "a Tomcat01\nb tomcat02\nc MG01\nd Tomcat03"
+    assert toolspec.trim(text, {"filter": "TOMCAT"}) == "a Tomcat01\nb tomcat02\nd Tomcat03"
+    assert toolspec.trim(text, {"filter": "tomcat", "head": 2}) == "a Tomcat01\nb tomcat02"
+    assert toolspec.trim(text, {"tail": 1}) == "d Tomcat03"
+    assert toolspec.trim(text, {"filter": "redis"}).startswith("(no line left")
+
+
+def test_instructions_allow_several_tools_per_turn():
+    from rca.ui.agents import instructions
+    assert "several tools in one turn" in instructions("bank-114", "Bank", True)
+
+
+
+def test_batch_runs_several_tools_in_one_call():
+    from rca.ui import events, toolspec
+
+    case = {"mode": "case", "system": "Bank", "case": "bank-114", "run": "ui-batch-test", "read": "", "write": ""}
+    calls = [{"tool": "question", "head": 1}, {"tool": "series", "component": "Tomcat02", "pattern": "JVMMemoryUsed",
+                                                "tail": 1}, {"tool": "series", "component": "Nope", "pattern": "x"}]
+    output, failed = toolspec.call(case, "batch", {"calls": calls})
+    assert not failed  # one of three failed, not all
+    assert output.count("=== ") == 3 and "=== question(head=1) ===" in output and "16:28=48.00" in output
+    assert "[error]" in output.split("=== series(component='Nope'")[1]
+    assert toolspec.call(case, "batch", {"calls": [{"tool": "batch", "calls": []}]})[1] is True
+    # The UI sees every call inside the batch.
+    shown = events.tool_call_event("t", "mcp__rca__batch", {"calls": calls})
+    assert [c["tool"] for c in shown["rca"]] == ["question", "series", "series"]
